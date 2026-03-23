@@ -38,14 +38,12 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/triton/support_test_base.h"
 #include "xla/backends/gpu/codegen/triton/test_utils.h"
 #include "xla/backends/gpu/codegen/triton/xtile_compiler.h"
-#include "xla/codegen/xtile/codegen/fusion_emitter.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/hlo/testlib/verified_hlo_module.h"
 #include "xla/primitive_util.h"
 #include "xla/service/gpu/gpu_device_info_for_tests.h"
-#include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/gpu/model/block_level_parameters.h"
 #include "xla/service/gpu/target_constants.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
@@ -59,6 +57,7 @@ namespace xla {
 namespace gpu {
 namespace {
 
+using ::testing::HasSubstr;
 using ::testing::Not;
 
 // Returns true if the given `opcode` supports the given `type` with respect to
@@ -2313,43 +2312,40 @@ INSTANTIATE_TEST_SUITE_P(
 
 using FusionTest = SupportTest;
 
-TEST_F(FusionTest, FusionComputationIsCheckedRecursively) {
-  // We expect test for fail as `flhs` is not a supported computation as
-  // fusion there is not an operand of a dot or a concatenate.
+TEST_F(FusionTest, NestedFusionsAreRejected) {
+  // Nested fusions are not supported by xtile emitter.
   absl::string_view hlo_text = R"(
-identity {
-  ROOT result = f32[128,256] parameter(0)
+lhs {
+  ROOT p0 = bf16[16,32] parameter(0)
 }
 
-flhs {
-  p0 = f32[128,256] parameter(0)
-  ROOT result = f32[128,256] fusion(p0), kind=kCustom, calls=identity, backend_config={
-    "fusion_backend_config":{"kind":"__triton_nested_gemm_fusion", "block_level_fusion_config":{
-    "output_tiles":[{"sizes":["16", "64"]}]}}}
+rhs {
+  ROOT p0 = bf16[32,64] parameter(0)
 }
 
-frhs {
-  ROOT result = f32[256,512] parameter(0)
-}
-
-ENTRY triton_computation {
-  p0 = f32[128,256] parameter(0)
-  p1 = f32[256,512] parameter(1)
-  lhs = f32[128,256] fusion(p0), kind=kCustom, calls=flhs, backend_config={
-    "fusion_backend_config":{"kind":"__triton_nested_gemm_fusion", "block_level_fusion_config":{
-    "output_tiles":[{"sizes":["16", "64"]}]}}}
-  rhs = f32[256,512]{1,0} fusion(p1), kind=kCustom, calls=frhs,
-    backend_config={ "fusion_backend_config":{ "kind":"__triton_nested_gemm_fusion",
-    "block_level_fusion_config": {"output_tiles":[{"sizes":["64", "32"]}]}}}
-  ROOT result = f32[128,512]{1,0} dot(lhs, rhs),
+triton_computation {
+  p0 = bf16[16,32] parameter(0)
+  p1 = bf16[32,64] parameter(1)
+  lhs = bf16[16,32] fusion(p0), kind=kCustom, calls=lhs
+  rhs = bf16[32,64] fusion(p1), kind=kCustom, calls=rhs
+  ROOT dot = bf16[16,64] dot(lhs, rhs),
     lhs_contracting_dims={1}, rhs_contracting_dims={0}
+}
+
+ENTRY entry {
+  p0 = bf16[16,32] parameter(0)
+  p1 = bf16[32,64] parameter(1)
+  ROOT fusion = bf16[16,64] fusion(p0, p1), kind=kCustom, calls=triton_computation
 }
 )";
   TF_ASSERT_OK_AND_ASSIGN(
       TestedInstruction ti,
       ParseTemplateAndGetInstruction(hlo_text, F32, HloOpcode::kFusion));
   se::GpuComputeCapability cc = DefaultDeviceForTesting();
-  ASSERT_FALSE(IsTritonSupportedInstruction(ti.Instruction(), cc));
+  CodegenDecision decision = IsTritonSupportedInstruction(ti.Instruction(), cc);
+  ASSERT_FALSE(decision.CanFuse());
+  EXPECT_THAT(decision.Explain(),
+              HasSubstr("Nested fusions are not supported"));
   RunSupportTest(std::move(ti), /*output_tile_sizes=*/{64, 32}, cc);
 }
 

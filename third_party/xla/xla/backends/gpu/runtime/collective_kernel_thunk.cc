@@ -165,7 +165,11 @@ absl::StatusOr<bool> CollectiveKernelThunk::IsSupported(
         << compute_capability.ToString() << ".";
     return false;
   }
-
+  if (collective_config_.replica_groups.empty()) {
+    XLA_VLOG_DEVICE(3, executor.device_ordinal())
+        << "Replica groups must be explicitly provided for collective kernels.";
+    return false;
+  }
   // TODO(b/407736956): Support variadic all-reduce.
   if (buffers_.size() != 1) {
     XLA_VLOG_DEVICE(3, executor.device_ordinal())

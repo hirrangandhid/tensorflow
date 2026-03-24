@@ -26,6 +26,7 @@ limitations under the License.
 #include "absl/strings/str_format.h"
 #include "absl/types/span.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/bit.h"
 #include "llvm/Support/MathExtras.h"
 #include "xla/core/collectives/rank_id.h"
 #include "xla/core/collectives/reduction_kind.h"
@@ -199,6 +200,11 @@ LaunchDimensions AllReduceLaunchDimensions(int64_t elements, int64_t num_ranks,
                                            AllReduceStrategy strategy) {
   int64_t threads_per_block;
   int64_t blocks_per_grid;
+  if (elements < se::gpu::kNumElementsPerThread) {
+    // 1 block, with enough threads to cover all ranks.
+    return LaunchDimensions(/*block_x_count=*/1,
+                            /*thread_x_count_per_block=*/num_ranks);
+  }
   const int64_t elements_per_rank =
       elements / (strategy == AllReduceStrategy::kTwoShot ? num_ranks : 1);
   // Maximum number of threads such that each thread has elements to process.
@@ -207,7 +213,8 @@ LaunchDimensions AllReduceLaunchDimensions(int64_t elements, int64_t num_ranks,
   // Triton expects power of 2 for threads_per_block / threads_per_warp.
   // Since threads_per_warp is 32 for all NVIDIA GPUs, power of 2 is guaranteed.
   threads_per_block =
-      std::min(kMaxThreadsPerBlock, llvm::PowerOf2Ceil(total_threads));
+      std::min(kMaxThreadsPerBlock,
+               llvm::bit_ceil(static_cast<uint64_t>(total_threads)));
   blocks_per_grid = std::min(kMaxBlocksPerGrid,
                              CeilOfRatio(total_threads, threads_per_block));
   return LaunchDimensions(blocks_per_grid, threads_per_block);
@@ -222,17 +229,6 @@ bool IsAllReduceKernelSupported(int64_t num_ranks, int64_t num_elements,
             << primitive_util::LowercasePrimitiveTypeName(element_type)
             << ") and reduction kind (" << absl::StrFormat("%v", reduction_kind)
             << ") combination is not supported.";
-    return false;
-  }
-  const int64_t alignment_requirement =
-      all_reduce_strategy == AllReduceStrategy::kOneShot ||
-              all_reduce_strategy == AllReduceStrategy::kMultimem
-          ? se::gpu::kNumElementsPerThread
-          : se::gpu::kNumElementsPerThread * num_ranks;
-
-  if (num_elements % alignment_requirement != 0) {
-    VLOG(3)
-        << "Number of elements is not aligned to the alignment requirement.";
     return false;
   }
   if (num_ranks > stream_executor::gpu::kMaxNumAllReduceInputPtrs) {

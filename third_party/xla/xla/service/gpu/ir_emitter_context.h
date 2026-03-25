@@ -20,7 +20,6 @@ limitations under the License.
 #include <memory>
 #include <string>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
@@ -28,8 +27,6 @@ limitations under the License.
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "mlir/IR/MLIRContext.h"
-#include "mlir/IR/Operation.h"
-#include "xla/backends/gpu/runtime/collective_thunk.h"
 #include "xla/backends/gpu/runtime/host_execute_thunk.h"
 #include "xla/backends/gpu/runtime/thunk_id.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -47,13 +44,6 @@ limitations under the License.
 
 namespace xla {
 namespace gpu {
-// Maps async start ops to their async events so we can emit done thunk
-// sharing events with corresponding start thunk. Async events may be null if
-// the start op is degenerate (so not emitted).
-using CollectivesAsyncEvents =
-    absl::flat_hash_map<std::variant<mlir::Operation*, const HloInstruction*>,
-                        std::shared_ptr<CollectiveThunk::AsyncEvents>>;
-
 // Maps host offloading start ops to their async events so we can emit done
 // thunk sharing events with corresponding start thunk.
 using InstructionToHostExecuteAsyncEvents =
@@ -126,9 +116,6 @@ class IrEmitterContext {
   }
 
   KernelReuseCache& kernel_cache() { return kernel_cache_; }
-  CollectivesAsyncEvents& collectives_async_events() {
-    return collectives_async_events_;
-  }
 
   InstructionToHostExecuteAsyncEvents&
   instruction_to_host_execute_async_events() {
@@ -170,7 +157,6 @@ class IrEmitterContext {
   const std::string data_layout_;
   llvm::Triple target_triple_;
 
-  CollectivesAsyncEvents collectives_async_events_;
   InstructionToHostExecuteAsyncEvents instruction_to_host_execute_async_events_;
 
   // We should not emit kernels when loading thunks from a compilation result.

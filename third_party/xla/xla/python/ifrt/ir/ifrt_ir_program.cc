@@ -20,6 +20,7 @@ limitations under the License.
 #include <memory>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
@@ -146,6 +147,46 @@ absl::Status IfrtIRCompileOptions::ToProto(IfrtIrCompileOptionsProto& proto,
   proto.set_dot_graph_min_per_device_transfer_size_bytes(
       dot_graph_min_per_device_transfer_size_bytes);
   return absl::OkStatus();
+}
+
+void IfrtIRCompileOptions::SetOptionsFromMap(
+    const absl::flat_hash_map<std::string, std::variant<std::string, bool>>&
+        options) {
+#define SET_BOOL_OPTION(field)                               \
+  if (auto it = options.find(#field); it != options.end()) { \
+    field = std::get<bool>(it->second);                      \
+  }
+
+  SET_BOOL_OPTION(mlir_enable_timing);
+#undef SET_BOOL_OPTION
+
+#define SET_STRING_OPTION(field)                             \
+  if (auto it = options.find(#field); it != options.end()) { \
+    field = std::get<std::string>(it->second);               \
+  }
+
+  SET_STRING_OPTION(mlir_dump_to);
+  SET_STRING_OPTION(mlir_dump_pass_re);
+  SET_STRING_OPTION(mlir_dump_func_re);
+  SET_STRING_OPTION(dot_graph_dump_to);
+#undef SET_STRING_OPTION
+
+#define SET_INT64_OPTION(field)                              \
+  if (auto it = options.find(#field); it != options.end()) { \
+    field = std::stoll(std::get<std::string>(it->second));   \
+  }
+
+  SET_INT64_OPTION(dot_graph_min_executable_peak_memory_bytes);
+  SET_INT64_OPTION(dot_graph_min_per_device_transfer_size_bytes);
+#undef SET_INT64_OPTION
+
+#define SET_FLOAT_OPTION(field)                              \
+  if (auto it = options.find(#field); it != options.end()) { \
+    field = std::stof(std::get<std::string>(it->second));    \
+  }
+
+  SET_FLOAT_OPTION(dot_graph_min_executable_flops);
+#undef SET_FLOAT_OPTION
 }
 
 llvm::raw_ostream& operator<<(llvm::raw_ostream& os,

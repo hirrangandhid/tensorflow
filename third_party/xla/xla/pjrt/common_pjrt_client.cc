@@ -1675,6 +1675,7 @@ CommonPjRtBufferImpl::CopyFromCpuToMemorySpace(
           std::unique_ptr<MutableLiteralBase> literal =
               std::make_unique<MutableBorrowingLiteral>(
                   reinterpret_cast<char*>(base_ptr), src_shape);
+          auto* dst_memory_space = dst_raw_buffer->memory_space();
           auto status_or_h2d_transfer_event = dst_client->LinearizeInto(
               *literal, device_shape,
               PjRtClient::HostBufferSemantics::kImmutableUntilTransferCompletes,
@@ -1688,8 +1689,10 @@ CommonPjRtBufferImpl::CopyFromCpuToMemorySpace(
                 src_usage_event_promise->SetReady();
               });
           if (dst_client->event_tracking_enabled()) {
-            h2d_transfer_event->AppendDescriptionToEvent(
-                " TransferToDevice ", {definition_event_promise.get()});
+            dst_client->AppendDescriptionToEvent(
+                dst_memory_space, h2d_transfer_event->async_value(),
+                " TransferToDevice ",
+                {definition_event_promise->async_value()});
           }
           definition_event_promise->Set(std::move(h2d_transfer_event));
         });
@@ -1956,7 +1959,11 @@ Future<> CommonPjRtBufferImpl::ToLiteralImpl(
   auto [promise, result] = common_client->CreateLinkedUserPromise(
       memory_space(), "CommonPjRtBuffer", "ToLiteral", "ToLiteralEvent");
   if (device_promise) {
-    device_promise->AddEventDependencies(src_definition_events_avs);
+    if (common_client->event_tracking_enabled()) {
+      common_client->AddEventDependencies(memory_space(),
+                                          device_promise->async_value(),
+                                          src_definition_events_avs);
+    }
   }
 
   // Wait for buffer definition events to finish before d2h dispatch.
@@ -2165,9 +2172,12 @@ Future<> CommonPjRtBufferImpl::CopyRawToHostFuture(Future<void*> dst,
 
   if (buf_client->event_tracking_enabled()) {
     if (!dst.IsReady()) {
-      usage_event_promise->RegisterClientThreadWait("CopyRawToHostFuture");
+      buf_client->RegisterClientThreadWait(memory_space(),
+                                           usage_event_promise->async_value(),
+                                           "CopyRawToHostFuture");
     }
-    usage_event_promise->AddEventDependencies(definition_events);
+    buf_client->AddEventDependencies(
+        memory_space(), usage_event_promise->async_value(), definition_events);
   }
 
   dst.OnReady([buf_client, transfer_size, offset,

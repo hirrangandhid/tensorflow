@@ -37,9 +37,11 @@ cc_library(
         ":nlohmann_json",
         "//tensorflow/lite:framework",
         "//tensorflow/lite/kernels:builtin_ops",
-        # Flex delegate — required for LSTM models (SELECT_TF_OPS / UnidirectionalSequenceLSTM)
-        "//tensorflow/lite/delegates/flex:delegate",
+        # Provides TfLiteDelegateUniquePtr without the full TF runtime.
+        # The flex delegate itself is loaded at runtime via dlopen.
+        "//tensorflow/lite/delegates/utils:simple_delegate_interface",
     ],
+    linkopts = ["-ldl"],  # for dlopen / dlsym
 )
 
 # ── Executable ────────────────────────────────────────────────────────────────

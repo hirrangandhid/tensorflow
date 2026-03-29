@@ -40,7 +40,9 @@ Four TFLite models are supported:
 
 #include "tensorflow/lite/interpreter.h"
 #include "tensorflow/lite/model_builder.h"
-#include "tensorflow/lite/delegates/flex/delegate.h"
+// Provides TfLiteDelegateUniquePtr without pulling in the full TF runtime.
+// The flex delegate itself is loaded dynamically via dlopen at runtime.
+#include "tensorflow/lite/delegates/utils/simple_delegate.h"
 
 namespace tflite {
 namespace anomaly_detection {

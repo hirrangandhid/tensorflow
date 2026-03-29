@@ -58,7 +58,7 @@ Output CSV columns:
 #include <unordered_map>
 #include <vector>
 
-#include "tensorflow/lite/delegates/flex/delegate.h"
+#include <dlfcn.h>  // dlopen / dlsym — for runtime flex delegate check
 
 namespace tflite {
 namespace anomaly_detection {
@@ -118,15 +118,27 @@ static void ParseTimestamp(const std::string& ts, int& hour, int& dow) {
 static bool CheckFlexDelegate() {
   std::cerr << "\n[lib-check] Testing Flex delegate (required for LSTM models)...\n";
 
-  auto d = tflite::FlexDelegate::Create();
-  if (!d) {
+  // Load the flex delegate SO dynamically; not required at link time.
+  void* lib = dlopen("libtensorflowlite_flex.so", RTLD_NOW | RTLD_GLOBAL);
+  bool available = false;
+  if (lib) {
+    using AcquireFn = TfLiteDelegateUniquePtr (*)();
+    auto* acquire = reinterpret_cast<AcquireFn>(dlsym(lib, "TF_AcquireFlexDelegate"));
+    if (acquire) {
+      auto d = acquire();       // destructs at end of this block
+      available = (d != nullptr);
+    }   // d destructs here — deleter called while lib is still open
+    dlclose(lib);               // safe: delegate already destroyed above
+  }
+
+  if (!available) {
     std::cerr
       << "[lib-check] FAIL: TfLiteFlexDelegateCreate() returned null.\n"
       << "            Likely cause: libtensorflowlite_flex.so is not in LD_LIBRARY_PATH\n"
       << "            or was not deployed alongside the binary.\n"
-      << "            → LSTM models (lstm_cpu_anomaly_model.tflite,\n"
+      << "            \u2192 LSTM models (lstm_cpu_anomaly_model.tflite,\n"
       << "                           lstm_memory_anomaly_model.tflite) will NOT work.\n"
-      << "            → Dense models (cpu_anomaly_model.tflite,\n"
+      << "            \u2192 Dense models (cpu_anomaly_model.tflite,\n"
       << "                            memory_anomaly_model.tflite) are unaffected.\n\n"
       << "  To fix on target:\n"
       << "    export LD_LIBRARY_PATH=/path/to/tflite/libs:$LD_LIBRARY_PATH\n"
@@ -142,8 +154,7 @@ static bool CheckFlexDelegate() {
     return false;
   }
 
-  // TfLiteDelegateUniquePtr automatically cleans up via RAII
-  std::cerr << "[lib-check] OK : Flex delegate available — LSTM models will work.\n\n";
+  std::cerr << "[lib-check] OK : Flex delegate available \u2014 LSTM models will work.\n\n";
   return true;
 }
 

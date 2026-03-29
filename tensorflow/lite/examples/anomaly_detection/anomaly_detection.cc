@@ -43,8 +43,9 @@ inference_app.ipynb. Every arithmetic operation matches the Python:
 
 #include "nlohmann_json/json.hpp"
 #include "tensorflow/lite/interpreter_builder.h"
-#include "tensorflow/lite/delegates/flex/delegate.h"
 #include "tensorflow/lite/kernels/register.h"
+
+#include <dlfcn.h>  // dlopen / dlsym — for loading libtensorflowlite_flex.so at runtime
 
 namespace tflite {
 namespace anomaly_detection {
@@ -177,15 +178,37 @@ void AnomalyInferenceEngine::LoadInterpreter(
 
   // Apply the Flex delegate for models that use SELECT_TF_OPS
   // (e.g. LSTM models — UnidirectionalSequenceLSTM is not a TFLite builtin).
-  // The C++ app must link libtensorflowlite_flex.so for this to work.
+  // The flex delegate shared library is loaded dynamically at runtime so that
+  // anomaly_app does NOT need to link the full TF runtime at build time.
   if (use_flex_delegate) {
-    auto flex_delegate = tflite::FlexDelegate::Create();
-    if (!flex_delegate)
-      throw std::runtime_error("Failed to create Flex delegate for: " + path);
-    if (interp_out->ModifyGraphWithDelegate(flex_delegate.get()) != kTfLiteOk)
+    void* flex_lib = dlopen("libtensorflowlite_flex.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!flex_lib)
+      throw std::runtime_error(
+          "dlopen(libtensorflowlite_flex.so) failed: " + std::string(dlerror()) +
+          "\nDeploy libtensorflowlite_flex.so on the target and set LD_LIBRARY_PATH.");
+
+    // TF_AcquireFlexDelegate() is the stable C export from libtensorflowlite_flex.so.
+    // It returns TfLiteDelegateUniquePtr (== std::unique_ptr<TfLiteDelegate, void(*)(TfLiteDelegate*)>).
+    using AcquireFn = TfLiteDelegateUniquePtr (*)();
+    auto* acquire = reinterpret_cast<AcquireFn>(dlsym(flex_lib, "TF_AcquireFlexDelegate"));
+    if (!acquire) {
+      dlclose(flex_lib);
+      throw std::runtime_error(
+          "Symbol TF_AcquireFlexDelegate not found in libtensorflowlite_flex.so");
+    }
+
+    auto flex_delegate = acquire();
+    if (!flex_delegate) {
+      dlclose(flex_lib);
+      throw std::runtime_error("TF_AcquireFlexDelegate() returned null for: " + path);
+    }
+    if (interp_out->ModifyGraphWithDelegate(flex_delegate.get()) != kTfLiteOk) {
+      dlclose(flex_lib);
       throw std::runtime_error("Failed to apply Flex delegate for: " + path);
-    // Delegate must outlive the interpreter; store via delegate_out parameter.
+    }
     if (delegate_out) *delegate_out = std::move(flex_delegate);
+    // Do NOT dlclose(flex_lib) — the delegate's deleter fn lives inside the SO;
+    // the SO must stay loaded for the process lifetime. The OS reclaims it at exit.
   }
 
   interp_out->SetNumThreads(num_threads_);

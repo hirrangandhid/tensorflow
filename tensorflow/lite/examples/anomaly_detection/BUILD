@@ -39,7 +39,7 @@ cc_library(
         "//tensorflow/lite/kernels:builtin_ops",
         # Provides TfLiteDelegateUniquePtr without the full TF runtime.
         # The flex delegate itself is loaded at runtime via dlopen.
-        "//tensorflow/lite/delegates/utils:simple_delegate_interface",
+        "//tensorflow/lite/delegates/utils:simple_delegate",
     ],
     linkopts = ["-ldl"],  # for dlopen / dlsym
 )

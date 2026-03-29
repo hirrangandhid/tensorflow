@@ -40,6 +40,7 @@ Four TFLite models are supported:
 
 #include "tensorflow/lite/interpreter.h"
 #include "tensorflow/lite/model_builder.h"
+#include "tensorflow/lite/delegates/flex/delegate.h"
 
 namespace tflite {
 namespace anomaly_detection {
@@ -156,6 +157,9 @@ class AnomalyInferenceEngine {
   std::unique_ptr<tflite::Interpreter> dense_mem_interp_;
   std::unique_ptr<tflite::Interpreter> lstm_cpu_interp_;
   std::unique_ptr<tflite::Interpreter> lstm_mem_interp_;
+  // Flex delegates for LSTM models — must outlive their interpreters
+  TfLiteDelegateUniquePtr lstm_cpu_delegate_;
+  TfLiteDelegateUniquePtr lstm_mem_delegate_;
 
   // Per-device state keyed by MAC string
   std::unordered_map<std::string, DeviceState> device_states_;
@@ -168,7 +172,8 @@ class AnomalyInferenceEngine {
   void LoadInterpreter(const std::string& path,
                        std::unique_ptr<tflite::FlatBufferModel>& fb_out,
                        std::unique_ptr<tflite::Interpreter>& interp_out,
-                       bool use_flex_delegate = false);
+                       bool use_flex_delegate = false,
+                       TfLiteDelegateUniquePtr* delegate_out = nullptr);
 
   // Compute CPU (10-feature) and Memory (9-feature) vectors from raw reading.
   // Matches Python _compute_features() exactly, including ddof=1 rolling std.

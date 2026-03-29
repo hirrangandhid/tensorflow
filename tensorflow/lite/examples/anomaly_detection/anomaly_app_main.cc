@@ -118,7 +118,7 @@ static void ParseTimestamp(const std::string& ts, int& hour, int& dow) {
 static bool CheckFlexDelegate() {
   std::cerr << "\n[lib-check] Testing Flex delegate (required for LSTM models)...\n";
 
-  TfLiteDelegate* d = TfLiteFlexDelegateCreate(nullptr);
+  auto d = tflite::FlexDelegate::Create();
   if (!d) {
     std::cerr
       << "[lib-check] FAIL: TfLiteFlexDelegateCreate() returned null.\n"
@@ -142,8 +142,7 @@ static bool CheckFlexDelegate() {
     return false;
   }
 
-  // Clean up — we only created it to test availability
-  TfLiteFlexDelegateDelete(d);
+  // TfLiteDelegateUniquePtr automatically cleans up via RAII
   std::cerr << "[lib-check] OK : Flex delegate available — LSTM models will work.\n\n";
   return true;
 }

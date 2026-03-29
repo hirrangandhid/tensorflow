@@ -157,9 +157,11 @@ class AnomalyInferenceEngine {
   std::unique_ptr<tflite::Interpreter> dense_mem_interp_;
   std::unique_ptr<tflite::Interpreter> lstm_cpu_interp_;
   std::unique_ptr<tflite::Interpreter> lstm_mem_interp_;
-  // Flex delegates for LSTM models — must outlive their interpreters
-  TfLiteDelegateUniquePtr lstm_cpu_delegate_;
-  TfLiteDelegateUniquePtr lstm_mem_delegate_;
+  // Flex delegates for LSTM models — must outlive their interpreters.
+  // Initialized with {nullptr, nullptr} because TfLiteDelegateUniquePtr uses
+  // a raw function pointer deleter which has no default constructor.
+  TfLiteDelegateUniquePtr lstm_cpu_delegate_{nullptr, nullptr};
+  TfLiteDelegateUniquePtr lstm_mem_delegate_{nullptr, nullptr};
 
   // Per-device state keyed by MAC string
   std::unordered_map<std::string, DeviceState> device_states_;

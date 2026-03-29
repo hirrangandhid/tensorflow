@@ -37,7 +37,6 @@ cc_library(
         ":nlohmann_json",
         "//tensorflow/lite:framework",
         "//tensorflow/lite/kernels:builtin_ops",
-        "//tensorflow/lite/core:interpreter_builder",
         # Flex delegate — required for LSTM models (SELECT_TF_OPS / UnidirectionalSequenceLSTM)
         "//tensorflow/lite/delegates/flex:delegate",
     ],

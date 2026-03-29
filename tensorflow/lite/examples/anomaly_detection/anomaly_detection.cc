@@ -42,7 +42,7 @@ inference_app.ipynb. Every arithmetic operation matches the Python:
 #include <vector>
 
 #include "nlohmann_json/json.hpp"
-#include "tensorflow/lite/core/interpreter_builder.h"
+#include "tensorflow/lite/interpreter_builder.h"
 #include "tensorflow/lite/delegates/flex/delegate.h"
 #include "tensorflow/lite/kernels/register.h"
 

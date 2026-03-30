@@ -187,11 +187,12 @@ void AnomalyInferenceEngine::LoadInterpreter(
   if (!interp_out)
     throw std::runtime_error("Failed to build interpreter for: " + path);
 
-  // Apply external hardware delegate (e.g. BStorm NPU) if a path was provided.
-  // This mirrors label_image --external_delegate_path / --external_delegate_options.
-  // The delegate is applied first so the hardware accelerator handles as many
-  // ops as possible before any remaining ops fall back to CPU or Flex.
-  if (!delegate_path_.empty()) {
+  // Apply external hardware delegate if a path was provided.
+  // Skipped for Flex-delegate models (LSTM): those use SELECT_TF_OPS which
+  // the hardware delegate does not support, and presenting an unsupported op
+  // graph to it causes a hard assert in the delegate core rather than a
+  // graceful fallback.
+  if (!delegate_path_.empty() && !use_flex_delegate) {
     TfLiteExternalDelegateOptions opts =
         TfLiteExternalDelegateOptionsDefault(delegate_path_.c_str());
 

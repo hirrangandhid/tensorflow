@@ -115,7 +115,7 @@ static void ParseDelegateOptions(TfLiteExternalDelegateOptions* opts,
   }
 }
 
-
+InferenceConfig LoadConfig(const std::string& config_path) {
   std::ifstream f(config_path);
   if (!f) throw std::runtime_error("Cannot open config: " + config_path);
 

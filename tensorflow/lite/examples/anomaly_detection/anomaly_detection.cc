@@ -230,23 +230,43 @@ void AnomalyInferenceEngine::LoadInterpreter(
       std::cerr << "[delegate] Warning: TfLiteExternalDelegateCreate returned null for "
                 << delegate_path_ << " — running on CPU for: " << path << "\n";
     } else {
-      // Record node count before delegation: each op is one node.
-      // After ModifyGraphWithDelegate, all ops accepted by the delegate are
-      // fused into a single delegate node, so:
-      //   delegated_ops = nodes_before - nodes_after + 1
+      // Capture op codes and node count before delegation.
+      // After ModifyGraphWithDelegate, ops accepted by the delegate are fused
+      // into delegate node(s). When all accepted ops form one contiguous
+      // subgraph: delegated_ops = nodes_before - nodes_after + 1.
       const int nodes_before = static_cast<int>(interp_out->nodes_size());
+      std::vector<int32_t> op_codes;
+      op_codes.reserve(nodes_before);
+      for (int i = 0; i < nodes_before; ++i) {
+        auto* nr = interp_out->node_and_registration(i);
+        op_codes.push_back(nr ? nr->second.builtin_code : -1);
+      }
       if (interp_out->ModifyGraphWithDelegate(raw) != kTfLiteOk) {
         std::cerr << "[delegate] Warning: ModifyGraphWithDelegate failed for: " << path
                   << " — running on CPU\n";
         TfLiteExternalDelegateDelete(raw);
       } else {
-        const int nodes_after    = static_cast<int>(interp_out->nodes_size());
-        const int delegated_ops  = nodes_before - nodes_after + 1;
-        const int cpu_ops        = nodes_after - 1;  // remaining non-delegate nodes
+        const int nodes_after = static_cast<int>(interp_out->nodes_size());
+        // When K ops are accepted in one contiguous subgraph:
+        //   nodes_after = (nodes_before - K) + 1  =>  K = nodes_before - nodes_after + 1
+        // When 0 ops accepted: nodes_after == nodes_before (no change), K = 0.
+        const int delegated_ops = (nodes_after < nodes_before)
+                                      ? (nodes_before - nodes_after + 1) : 0;
+        const int cpu_ops = nodes_before - delegated_ops;
         std::cerr << "[delegate] Hardware delegate applied for: " << path << "\n"
                   << "[delegate]   ops on NPU : " << delegated_ops
                   << " / " << nodes_before << "\n"
                   << "[delegate]   ops on CPU : " << cpu_ops << "\n";
+        if (delegated_ops == 0) {
+          std::cerr << "[delegate]   TFLite builtin_code for each op:";
+          for (auto c : op_codes) std::cerr << " " << c;
+          std::cerr << "\n"
+                    << "[delegate]   NPU accepted 0 ops — tensor shapes may be below\n"
+                    << "[delegate]   the NPU minimum or the JIT compile step rejected them.\n"
+                    << "[delegate]   Inference will run on CPU.\n";
+                    << "[delegate]   are not supported by the NPU on this platform.\n"
+                    << "[delegate]   Inference will run on CPU.\n";
+        }
         if (ext_delegate_out)
           *ext_delegate_out = TfLiteDelegateUniquePtr{raw, TfLiteExternalDelegateDelete};
         else

@@ -230,16 +230,27 @@ void AnomalyInferenceEngine::LoadInterpreter(
       std::cerr << "[delegate] Warning: TfLiteExternalDelegateCreate returned null for "
                 << delegate_path_ << " — running on CPU for: " << path << "\n";
     } else {
+      // Record node count before delegation: each op is one node.
+      // After ModifyGraphWithDelegate, all ops accepted by the delegate are
+      // fused into a single delegate node, so:
+      //   delegated_ops = nodes_before - nodes_after + 1
+      const int nodes_before = static_cast<int>(interp_out->nodes_size());
       if (interp_out->ModifyGraphWithDelegate(raw) != kTfLiteOk) {
         std::cerr << "[delegate] Warning: ModifyGraphWithDelegate failed for: " << path
                   << " — running on CPU\n";
         TfLiteExternalDelegateDelete(raw);
       } else {
-        std::cerr << "[delegate] Hardware delegate applied for: " << path << "\n";
+        const int nodes_after    = static_cast<int>(interp_out->nodes_size());
+        const int delegated_ops  = nodes_before - nodes_after + 1;
+        const int cpu_ops        = nodes_after - 1;  // remaining non-delegate nodes
+        std::cerr << "[delegate] Hardware delegate applied for: " << path << "\n"
+                  << "[delegate]   ops on NPU : " << delegated_ops
+                  << " / " << nodes_before << "\n"
+                  << "[delegate]   ops on CPU : " << cpu_ops << "\n";
         if (ext_delegate_out)
           *ext_delegate_out = TfLiteDelegateUniquePtr{raw, TfLiteExternalDelegateDelete};
         else
-          TfLiteExternalDelegateDelete(raw);  // interpreter took ownership; safe to delete handle
+          TfLiteExternalDelegateDelete(raw);
       }
     }
   }

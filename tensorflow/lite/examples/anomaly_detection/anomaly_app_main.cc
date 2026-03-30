@@ -27,6 +27,10 @@ Options:
                              (default: reads CSV from stdin)
   --output,     -o  <path>   Path to output CSV  (default: stdout)
   --threads,    -t  <n>      Number of TFLite threads (default: 1)
+  --delegate-path,  -d <path>  Path to external hardware delegate .so
+                             (e.g. /usr/lib/libbstorm_external_delegate.so)
+  --delegate-options  <str>  Semicolon-separated key:value options for the delegate
+                             (e.g. "bstm:1;bstm-client-mode:0;dynamic-tensors:1")
   --verbose,    -v           Print per-reading details
   --check-libs               Check shared library availability and exit
   --help,       -h           Print this message
@@ -169,6 +173,12 @@ static void PrintUsage(const char* prog) {
     << "  --input,    -i <path>   Input CSV file          (default: stdin)\n"
     << "  --output,   -o <path>   Output CSV file         (default: stdout)\n"
     << "  --threads,  -t <n>      TFLite thread count     (default: 1)\n"
+    << "  --delegate-path,  -d <path>\n"
+    << "                          External hardware delegate .so\n"
+    << "                          (e.g. /usr/lib/libbstorm_external_delegate.so)\n"
+    << "  --delegate-options <key:val;key:val>\n"
+    << "                          Options passed to the delegate\n"
+    << "                          (e.g. \"bstm:1;bstm-client-mode:0;dynamic-tensors:1\")\n"
     << "  --verbose,  -v          Print per-reading details to stderr\n"
     << "  --check-libs            Check shared library availability and exit\n"
     << "  --help,     -h          Print this message\n\n";
@@ -179,6 +189,8 @@ int Main(int argc, char** argv) {
   std::string config_path = "inference_config.json";
   std::string input_path;
   std::string output_path;
+  std::string delegate_path;
+  std::string delegate_options;
   int  num_threads = 1;
   bool verbose     = false;
   bool check_libs  = false;
@@ -196,6 +208,10 @@ int Main(int argc, char** argv) {
       output_path = argv[++i];
     } else if ((arg == "--threads" || arg == "-t") && i + 1 < argc) {
       num_threads = std::atoi(argv[++i]);
+    } else if ((arg == "--delegate-path" || arg == "-d") && i + 1 < argc) {
+      delegate_path = argv[++i];
+    } else if (arg == "--delegate-options" && i + 1 < argc) {
+      delegate_options = argv[++i];
     } else if (arg == "--verbose" || arg == "-v") {
       verbose = true;
     } else if (arg == "--help" || arg == "-h") {
@@ -219,7 +235,7 @@ int Main(int argc, char** argv) {
 
   // ── Initialise engine ─────────────────────────────────────────────────────
   std::cerr << "Loading config: " << config_path << "\n";
-  AnomalyInferenceEngine engine(config_path, num_threads);
+  AnomalyInferenceEngine engine(config_path, num_threads, delegate_path, delegate_options);
   std::cerr << "Engine ready.  SEQ_LEN=" << engine.seq_len()
             << "  threads=" << num_threads << "\n";
 

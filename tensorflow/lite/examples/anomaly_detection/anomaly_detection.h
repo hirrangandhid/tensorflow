@@ -43,6 +43,9 @@ Four TFLite models are supported:
 // Provides TfLiteDelegateUniquePtr without pulling in the full TF runtime.
 // The flex delegate itself is loaded dynamically via dlopen at runtime.
 #include "tensorflow/lite/delegates/utils/simple_delegate.h"
+// External delegate API — used to load hardware accelerators (e.g. BStorm NPU)
+// via --delegate-path at runtime, matching the label_image --external_delegate_path pattern.
+#include "tensorflow/lite/delegates/external/external_delegate.h"
 
 namespace tflite {
 namespace anomaly_detection {
@@ -132,8 +135,14 @@ struct DeviceState {
 // ─────────────────────────────────────────────────────────────────────────────
 class AnomalyInferenceEngine {
  public:
+  // delegate_path    : path to a TFLite external delegate .so
+  //                    (e.g. "/usr/lib/libbstorm_external_delegate.so")
+  // delegate_options  : semicolon-separated key:value pairs passed to the delegate
+  //                    (e.g. "bstm:1;bstm-client-mode:0;dynamic-tensors:1")
   explicit AnomalyInferenceEngine(const std::string& config_path,
-                                   int num_threads = 1);
+                                   int num_threads = 1,
+                                   const std::string& delegate_path = "",
+                                   const std::string& delegate_options = "");
 
   // Process a single telemetry reading for a device.
   // State (rolling window) is accumulated per MAC address.
@@ -148,6 +157,8 @@ class AnomalyInferenceEngine {
   InferenceConfig cfg_;
   int             seq_len_;
   int             num_threads_ = 1;
+  std::string     delegate_path_;     // path to external hardware delegate .so
+  std::string     delegate_options_;  // semicolon-separated key:value options
 
   // TFLite model data + interpreters (dense and optional LSTM)
   std::unique_ptr<tflite::FlatBufferModel> dense_cpu_fb_;
@@ -164,6 +175,11 @@ class AnomalyInferenceEngine {
   // a raw function pointer deleter which has no default constructor.
   TfLiteDelegateUniquePtr lstm_cpu_delegate_{nullptr, nullptr};
   TfLiteDelegateUniquePtr lstm_mem_delegate_{nullptr, nullptr};
+  // External (hardware) delegates — one per interpreter, must outlive the interpreter.
+  TfLiteDelegateUniquePtr dense_cpu_ext_delegate_{nullptr, nullptr};
+  TfLiteDelegateUniquePtr dense_mem_ext_delegate_{nullptr, nullptr};
+  TfLiteDelegateUniquePtr lstm_cpu_ext_delegate_{nullptr, nullptr};
+  TfLiteDelegateUniquePtr lstm_mem_ext_delegate_{nullptr, nullptr};
 
   // Per-device state keyed by MAC string
   std::unordered_map<std::string, DeviceState> device_states_;
@@ -173,11 +189,13 @@ class AnomalyInferenceEngine {
 
   // use_flex_delegate=true required for LSTM models (flex_delegate: true in config)
   // because UnidirectionalSequenceLSTM is a SELECT_TF_OPS op, not a TFLite builtin.
+  // ext_delegate_out receives ownership of the external hardware delegate (if any).
   void LoadInterpreter(const std::string& path,
                        std::unique_ptr<tflite::FlatBufferModel>& fb_out,
                        std::unique_ptr<tflite::Interpreter>& interp_out,
                        bool use_flex_delegate = false,
-                       TfLiteDelegateUniquePtr* delegate_out = nullptr);
+                       TfLiteDelegateUniquePtr* delegate_out = nullptr,
+                       TfLiteDelegateUniquePtr* ext_delegate_out = nullptr);
 
   // Compute CPU (10-feature) and Memory (9-feature) vectors from raw reading.
   // Matches Python _compute_features() exactly, including ddof=1 rolling std.

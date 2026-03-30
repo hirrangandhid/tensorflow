@@ -42,6 +42,7 @@ inference_app.ipynb. Every arithmetic operation matches the Python:
 #include <vector>
 
 #include "nlohmann_json/json.hpp"
+#include "tensorflow/lite/delegates/external/external_delegate.h"
 #include "tensorflow/lite/interpreter_builder.h"
 #include "tensorflow/lite/kernels/register.h"
 
@@ -98,7 +99,23 @@ static ModelConfig ParseModelConfig(const json& j) {
   return mc;
 }
 
-InferenceConfig LoadConfig(const std::string& config_path) {
+// Parse "key1:val1;key2:val2" and insert each pair into delegate options.
+// Matches the --external_delegate_options format used by label_image.
+static void ParseDelegateOptions(TfLiteExternalDelegateOptions* opts,
+                                  const std::string& options_str) {
+  std::stringstream ss(options_str);
+  std::string token;
+  while (std::getline(ss, token, ';')) {
+    auto colon = token.find(':');
+    if (colon != std::string::npos) {
+      std::string key = token.substr(0, colon);
+      std::string val = token.substr(colon + 1);
+      TfLiteExternalDelegateOptionsInsert(opts, key.c_str(), val.c_str());
+    }
+  }
+}
+
+
   std::ifstream f(config_path);
   if (!f) throw std::runtime_error("Cannot open config: " + config_path);
 
@@ -126,20 +143,27 @@ InferenceConfig LoadConfig(const std::string& config_path) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 AnomalyInferenceEngine::AnomalyInferenceEngine(const std::string& config_path,
-                                               int num_threads) {
-  cfg_          = LoadConfig(config_path);
-  seq_len_      = cfg_.rolling_window;
-  num_threads_  = num_threads;
+                                               int num_threads,
+                                               const std::string& delegate_path,
+                                               const std::string& delegate_options) {
+  cfg_              = LoadConfig(config_path);
+  seq_len_          = cfg_.rolling_window;
+  num_threads_      = num_threads;
+  delegate_path_    = delegate_path;
+  delegate_options_ = delegate_options;
 
   // Dense models are always required
-  LoadInterpreter(cfg_.cpu_model.tflite_file,    dense_cpu_fb_, dense_cpu_interp_);
-  LoadInterpreter(cfg_.memory_model.tflite_file, dense_mem_fb_, dense_mem_interp_);
+  LoadInterpreter(cfg_.cpu_model.tflite_file,    dense_cpu_fb_, dense_cpu_interp_,
+                  false, nullptr, &dense_cpu_ext_delegate_);
+  LoadInterpreter(cfg_.memory_model.tflite_file, dense_mem_fb_, dense_mem_interp_,
+                  false, nullptr, &dense_mem_ext_delegate_);
 
   // LSTM models are optional — they use SELECT_TF_OPS (Flex delegate)
   if (cfg_.has_lstm_cpu) {
     try {
       LoadInterpreter(cfg_.lstm_cpu_model.tflite_file, lstm_cpu_fb_, lstm_cpu_interp_,
-                      cfg_.lstm_cpu_model.flex_delegate, &lstm_cpu_delegate_);
+                      cfg_.lstm_cpu_model.flex_delegate, &lstm_cpu_delegate_,
+                      &lstm_cpu_ext_delegate_);
     } catch (const std::exception& e) {
       std::cerr << "Warning: could not load lstm_cpu_model — " << e.what() << "\n";
       cfg_.has_lstm_cpu = false;
@@ -148,7 +172,8 @@ AnomalyInferenceEngine::AnomalyInferenceEngine(const std::string& config_path,
   if (cfg_.has_lstm_mem) {
     try {
       LoadInterpreter(cfg_.lstm_memory_model.tflite_file, lstm_mem_fb_, lstm_mem_interp_,
-                      cfg_.lstm_memory_model.flex_delegate, &lstm_mem_delegate_);
+                      cfg_.lstm_memory_model.flex_delegate, &lstm_mem_delegate_,
+                      &lstm_mem_ext_delegate_);
     } catch (const std::exception& e) {
       std::cerr << "Warning: could not load lstm_memory_model — " << e.what() << "\n";
       cfg_.has_lstm_mem = false;
@@ -165,7 +190,8 @@ void AnomalyInferenceEngine::LoadInterpreter(
     std::unique_ptr<tflite::FlatBufferModel>& fb_out,
     std::unique_ptr<tflite::Interpreter>& interp_out,
     bool use_flex_delegate,
-    TfLiteDelegateUniquePtr* delegate_out) {
+    TfLiteDelegateUniquePtr* delegate_out,
+    TfLiteDelegateUniquePtr* ext_delegate_out) {
 
   fb_out = tflite::FlatBufferModel::BuildFromFile(path.c_str());
   if (!fb_out)
@@ -175,6 +201,35 @@ void AnomalyInferenceEngine::LoadInterpreter(
   tflite::InterpreterBuilder(*fb_out, resolver)(&interp_out);
   if (!interp_out)
     throw std::runtime_error("Failed to build interpreter for: " + path);
+
+  // Apply external hardware delegate (e.g. BStorm NPU) if a path was provided.
+  // This mirrors label_image --external_delegate_path / --external_delegate_options.
+  // The delegate is applied first so the hardware accelerator handles as many
+  // ops as possible before any remaining ops fall back to CPU or Flex.
+  if (!delegate_path_.empty()) {
+    TfLiteExternalDelegateOptions opts =
+        TfLiteExternalDelegateOptionsDefault(delegate_path_.c_str());
+    if (!delegate_options_.empty())
+      ParseDelegateOptions(&opts, delegate_options_);
+
+    TfLiteDelegate* raw = TfLiteExternalDelegateCreate(&opts);
+    if (!raw) {
+      std::cerr << "[delegate] Warning: TfLiteExternalDelegateCreate returned null for "
+                << delegate_path_ << " — running on CPU for: " << path << "\n";
+    } else {
+      if (interp_out->ModifyGraphWithDelegate(raw) != kTfLiteOk) {
+        std::cerr << "[delegate] Warning: ModifyGraphWithDelegate failed for: " << path
+                  << " — running on CPU\n";
+        TfLiteExternalDelegateDelete(raw);
+      } else {
+        std::cerr << "[delegate] Hardware delegate applied for: " << path << "\n";
+        if (ext_delegate_out)
+          *ext_delegate_out = TfLiteDelegateUniquePtr{raw, TfLiteExternalDelegateDelete};
+        else
+          TfLiteExternalDelegateDelete(raw);  // interpreter took ownership; safe to delete handle
+      }
+    }
+  }
 
   // Apply the Flex delegate for models that use SELECT_TF_OPS
   // (e.g. LSTM models — UnidirectionalSequenceLSTM is not a TFLite builtin).

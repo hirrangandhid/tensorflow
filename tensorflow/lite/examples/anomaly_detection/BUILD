@@ -40,8 +40,10 @@ cc_library(
         # Provides TfLiteDelegateUniquePtr without the full TF runtime.
         # The flex delegate itself is loaded at runtime via dlopen.
         "//tensorflow/lite/delegates/utils:simple_delegate",
+        # External delegate API — TfLiteExternalDelegateCreate/Delete for hardware accelerators.
+        "//tensorflow/lite/delegates/external:external_delegate",
     ],
-    linkopts = ["-ldl"],  # for dlopen / dlsym
+    linkopts = ["-ldl"],  # for dlopen / dlsym (flex delegate)
 )
 
 # ── Executable ────────────────────────────────────────────────────────────────

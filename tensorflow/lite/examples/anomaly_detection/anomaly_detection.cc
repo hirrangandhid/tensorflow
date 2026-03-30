@@ -264,8 +264,6 @@ void AnomalyInferenceEngine::LoadInterpreter(
                     << "[delegate]   NPU accepted 0 ops — tensor shapes may be below\n"
                     << "[delegate]   the NPU minimum or the JIT compile step rejected them.\n"
                     << "[delegate]   Inference will run on CPU.\n";
-                    << "[delegate]   are not supported by the NPU on this platform.\n"
-                    << "[delegate]   Inference will run on CPU.\n";
         }
         if (ext_delegate_out)
           *ext_delegate_out = TfLiteDelegateUniquePtr{raw, TfLiteExternalDelegateDelete};

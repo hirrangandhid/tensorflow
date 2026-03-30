@@ -99,21 +99,6 @@ static ModelConfig ParseModelConfig(const json& j) {
   return mc;
 }
 
-// Parse "key1:val1;key2:val2" and insert each pair into delegate options.
-// Matches the --external_delegate_options format used by label_image.
-static void ParseDelegateOptions(TfLiteExternalDelegateOptions* opts,
-                                  const std::string& options_str) {
-  std::stringstream ss(options_str);
-  std::string token;
-  while (std::getline(ss, token, ';')) {
-    auto colon = token.find(':');
-    if (colon != std::string::npos) {
-      std::string key = token.substr(0, colon);
-      std::string val = token.substr(colon + 1);
-      TfLiteExternalDelegateOptionsInsert(opts, key.c_str(), val.c_str());
-    }
-  }
-}
 
 InferenceConfig LoadConfig(const std::string& config_path) {
   std::ifstream f(config_path);
@@ -209,10 +194,37 @@ void AnomalyInferenceEngine::LoadInterpreter(
   if (!delegate_path_.empty()) {
     TfLiteExternalDelegateOptions opts =
         TfLiteExternalDelegateOptionsDefault(delegate_path_.c_str());
-    if (!delegate_options_.empty())
-      ParseDelegateOptions(&opts, delegate_options_);
+
+    // IMPORTANT: TfLiteExternalDelegateOptionsInsert stores raw const char* pointers
+    // without copying them. The strings MUST outlive the TfLiteExternalDelegateCreate call.
+    // Pre-split all options first and reserve the exact count before inserting, so
+    // the vectors never reallocate mid-loop and previously stored c_str() pointers
+    // remain valid when TfLiteExternalDelegateCreate reads them.
+    std::vector<std::string> opt_keys, opt_vals;
+    if (!delegate_options_.empty()) {
+      // Pre-split to get the final count before any reserve/insert
+      std::vector<std::string> option_pairs;
+      {
+        std::stringstream oss(delegate_options_);
+        std::string tok;
+        while (std::getline(oss, tok, ';'))
+          if (!tok.empty()) option_pairs.push_back(tok);
+      }
+      opt_keys.reserve(option_pairs.size());
+      opt_vals.reserve(option_pairs.size());
+      for (const auto& pair : option_pairs) {
+        auto colon = pair.find(':');
+        if (colon != std::string::npos) {
+          opt_keys.emplace_back(pair.substr(0, colon));
+          opt_vals.emplace_back(pair.substr(colon + 1));
+          TfLiteExternalDelegateOptionsInsert(
+              &opts, opt_keys.back().c_str(), opt_vals.back().c_str());
+        }
+      }
+    }
 
     TfLiteDelegate* raw = TfLiteExternalDelegateCreate(&opts);
+    // opt_keys / opt_vals still in scope here — safe for Create() to read them above.
     if (!raw) {
       std::cerr << "[delegate] Warning: TfLiteExternalDelegateCreate returned null for "
                 << delegate_path_ << " — running on CPU for: " << path << "\n";

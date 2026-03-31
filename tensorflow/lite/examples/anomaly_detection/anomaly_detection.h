@@ -142,7 +142,8 @@ class AnomalyInferenceEngine {
   explicit AnomalyInferenceEngine(const std::string& config_path,
                                    int num_threads = 1,
                                    const std::string& delegate_path = "",
-                                   const std::string& delegate_options = "");
+                                   const std::string& delegate_options = "",
+                                   bool verbose = false);
 
   // Process a single telemetry reading for a device.
   // State (rolling window) is accumulated per MAC address.
@@ -159,6 +160,7 @@ class AnomalyInferenceEngine {
   int             num_threads_ = 1;
   std::string     delegate_path_;     // path to external hardware delegate .so
   std::string     delegate_options_;  // semicolon-separated key:value options
+  bool            verbose_ = false;   // if true, PrintInterpreterState after each model load
 
   // TFLite model data + interpreters (dense and optional LSTM)
   std::unique_ptr<tflite::FlatBufferModel> dense_cpu_fb_;
@@ -195,7 +197,8 @@ class AnomalyInferenceEngine {
                        std::unique_ptr<tflite::Interpreter>& interp_out,
                        bool use_flex_delegate = false,
                        TfLiteDelegateUniquePtr* delegate_out = nullptr,
-                       TfLiteDelegateUniquePtr* ext_delegate_out = nullptr);
+                       TfLiteDelegateUniquePtr* ext_delegate_out = nullptr,
+                       bool verbose = false);
 
   // Compute CPU (10-feature) and Memory (9-feature) vectors from raw reading.
   // Matches Python _compute_features() exactly, including ddof=1 rolling std.

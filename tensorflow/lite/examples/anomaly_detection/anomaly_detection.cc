@@ -45,6 +45,7 @@ inference_app.ipynb. Every arithmetic operation matches the Python:
 #include "tensorflow/lite/delegates/external/external_delegate.h"
 #include "tensorflow/lite/interpreter_builder.h"
 #include "tensorflow/lite/kernels/register.h"
+#include "tensorflow/lite/optional_debug_tools.h"
 
 #include <dlfcn.h>  // dlopen / dlsym — for loading libtensorflowlite_flex.so at runtime
 
@@ -130,25 +131,27 @@ InferenceConfig LoadConfig(const std::string& config_path) {
 AnomalyInferenceEngine::AnomalyInferenceEngine(const std::string& config_path,
                                                int num_threads,
                                                const std::string& delegate_path,
-                                               const std::string& delegate_options) {
+                                               const std::string& delegate_options,
+                                               bool verbose) {
   cfg_              = LoadConfig(config_path);
   seq_len_          = cfg_.rolling_window;
   num_threads_      = num_threads;
   delegate_path_    = delegate_path;
   delegate_options_ = delegate_options;
+  verbose_          = verbose;
 
   // Dense models are always required
   LoadInterpreter(cfg_.cpu_model.tflite_file,    dense_cpu_fb_, dense_cpu_interp_,
-                  false, nullptr, &dense_cpu_ext_delegate_);
+                  false, nullptr, &dense_cpu_ext_delegate_, verbose_);
   LoadInterpreter(cfg_.memory_model.tflite_file, dense_mem_fb_, dense_mem_interp_,
-                  false, nullptr, &dense_mem_ext_delegate_);
+                  false, nullptr, &dense_mem_ext_delegate_, verbose_);
 
   // LSTM models are optional — they use SELECT_TF_OPS (Flex delegate)
   if (cfg_.has_lstm_cpu) {
     try {
       LoadInterpreter(cfg_.lstm_cpu_model.tflite_file, lstm_cpu_fb_, lstm_cpu_interp_,
                       cfg_.lstm_cpu_model.flex_delegate, &lstm_cpu_delegate_,
-                      &lstm_cpu_ext_delegate_);
+                      &lstm_cpu_ext_delegate_, verbose_);
     } catch (const std::exception& e) {
       std::cerr << "Warning: could not load lstm_cpu_model — " << e.what() << "\n";
       cfg_.has_lstm_cpu = false;
@@ -158,7 +161,7 @@ AnomalyInferenceEngine::AnomalyInferenceEngine(const std::string& config_path,
     try {
       LoadInterpreter(cfg_.lstm_memory_model.tflite_file, lstm_mem_fb_, lstm_mem_interp_,
                       cfg_.lstm_memory_model.flex_delegate, &lstm_mem_delegate_,
-                      &lstm_mem_ext_delegate_);
+                      &lstm_mem_ext_delegate_, verbose_);
     } catch (const std::exception& e) {
       std::cerr << "Warning: could not load lstm_memory_model — " << e.what() << "\n";
       cfg_.has_lstm_mem = false;
@@ -176,7 +179,8 @@ void AnomalyInferenceEngine::LoadInterpreter(
     std::unique_ptr<tflite::Interpreter>& interp_out,
     bool use_flex_delegate,
     TfLiteDelegateUniquePtr* delegate_out,
-    TfLiteDelegateUniquePtr* ext_delegate_out) {
+    TfLiteDelegateUniquePtr* ext_delegate_out,
+    bool verbose) {
 
   fb_out = tflite::FlatBufferModel::BuildFromFile(path.c_str());
   if (!fb_out)
@@ -312,6 +316,9 @@ void AnomalyInferenceEngine::LoadInterpreter(
 
   if (interp_out->AllocateTensors() != kTfLiteOk)
     throw std::runtime_error("AllocateTensors() failed for: " + path);
+
+  if (verbose)
+    tflite::PrintInterpreterState(interp_out.get());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -59,6 +59,7 @@ Output CSV columns:
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <sys/time.h>
 #include <unordered_map>
 #include <vector>
 
@@ -66,6 +67,10 @@ Output CSV columns:
 
 namespace tflite {
 namespace anomaly_detection {
+
+static double get_us(struct timeval t) {
+  return static_cast<double>(t.tv_sec) * 1e6 + t.tv_usec;
+}
 
 // ── Minimal CSV parser ────────────────────────────────────────────────────────
 static std::vector<std::string> SplitCsv(const std::string& line) {
@@ -235,7 +240,7 @@ int Main(int argc, char** argv) {
 
   // ── Initialise engine ─────────────────────────────────────────────────────
   std::cerr << "Loading config: " << config_path << "\n";
-  AnomalyInferenceEngine engine(config_path, num_threads, delegate_path, delegate_options);
+  AnomalyInferenceEngine engine(config_path, num_threads, delegate_path, delegate_options, verbose);
   std::cerr << "Engine ready.  SEQ_LEN=" << engine.seq_len()
             << "  threads=" << num_threads << "\n";
 
@@ -314,13 +319,15 @@ int Main(int argc, char** argv) {
               << std::setw(10) << "CPU_sev"
               << std::setw(10) << "Mem_sev"
               << std::setw(10) << "Type"
+              << std::setw(12) << "Time(ms)"
               << "Alert\n"
-              << std::string(75, '-') << "\n";
+              << std::string(87, '-') << "\n";
   }
 
   // ── Process rows ──────────────────────────────────────────────────────────
   std::string line;
   int row_num = 0;
+  double total_inference_us = 0.0;
   while (std::getline(in, line)) {
     if (line.empty()) continue;
     std::vector<std::string> fields = SplitCsv(line);
@@ -361,7 +368,12 @@ int Main(int argc, char** argv) {
     }
 
     // Run inference
+    struct timeval t0, t1;
+    gettimeofday(&t0, nullptr);
     AnomalyResult res = engine.ProcessReading(rdg);
+    gettimeofday(&t1, nullptr);
+    const double elapsed_us = get_us(t1) - get_us(t0);
+    total_inference_us += elapsed_us;
     has_lstm = res.has_lstm;
 
     // Write CSV header on first result
@@ -406,6 +418,7 @@ int Main(int argc, char** argv) {
                 << std::setw(10) << std::setprecision(3) << res.dense_cpu_sev
                 << std::setw(10) << res.dense_mem_sev
                 << std::setw(10) << res.anomaly_type
+                << std::setw(12) << std::setprecision(3) << elapsed_us / 1000.0 << "ms"
                 << alert << "\n";
     }
     ++row_num;
@@ -414,6 +427,11 @@ int Main(int argc, char** argv) {
   if (!header_written) WriteHeader(false);  // empty input edge case
 
   std::cerr << "\nProcessed " << row_num << " readings.\n";
+  if (row_num > 0) {
+    std::cerr << std::fixed << std::setprecision(3)
+              << "Total inference time : " << total_inference_us / 1000.0 << " ms\n"
+              << "Average time/reading : " << total_inference_us / row_num / 1000.0 << " ms\n";
+  }
   return EXIT_SUCCESS;
 }
 

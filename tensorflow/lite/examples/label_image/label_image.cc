@@ -266,12 +266,37 @@ void RunInference(Settings* settings,
   auto delegates = delegate_providers.CreateAllDelegates();
   for (auto& delegate : delegates) {
     const auto delegate_name = delegate.provider->GetName();
+    const int nodes_before = static_cast<int>(interpreter->nodes_size());
+
+    // Capture op codes before delegation so we can report them if 0 ops are accepted.
+    std::vector<int32_t> op_codes;
+    op_codes.reserve(nodes_before);
+    for (int i = 0; i < nodes_before; ++i) {
+      auto* nr = interpreter->node_and_registration(i);
+      op_codes.push_back(nr ? nr->second.builtin_code : -1);
+    }
+
     if (interpreter->ModifyGraphWithDelegate(std::move(delegate.delegate)) !=
         kTfLiteOk) {
       LOG(ERROR) << "Failed to apply " << delegate_name << " delegate.";
       exit(-1);
     } else {
-      LOG(INFO) << "Applied " << delegate_name << " delegate.";
+      const int nodes_after   = static_cast<int>(interpreter->nodes_size());
+      const int delegated_ops = (nodes_after < nodes_before)
+                                    ? (nodes_before - nodes_after + 1) : 0;
+      const int cpu_ops       = nodes_before - delegated_ops;
+      LOG(INFO) << "Applied " << delegate_name << " delegate."
+                << "  ops on NPU: " << delegated_ops << " / " << nodes_before
+                << "  ops on CPU: " << cpu_ops;
+      if (delegated_ops == 0) {
+        std::string codes_str;
+        for (auto c : op_codes) codes_str += " " + std::to_string(c);
+        LOG(WARNING) << delegate_name << " delegate accepted 0 ops."
+                     << " builtin_codes:" << codes_str
+                     << " — tensor shapes may be below the NPU minimum"
+                     << " or the JIT compile step rejected them."
+                     << " Inference will run on CPU.";
+      }
     }
   }
 

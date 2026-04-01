@@ -427,11 +427,11 @@ int Main(int argc, char** argv) {
   if (!header_written) WriteHeader(false);  // empty input edge case
 
   std::cerr << "\nProcessed " << row_num << " readings.\n";
-  if (row_num > 0) {
-    std::cerr << std::fixed << std::setprecision(3)
-              << "Total inference time : " << total_inference_us / 1000.0 << " ms\n"
-              << "Average time/reading : " << total_inference_us / row_num / 1000.0 << " ms\n";
-  }
+  // if (row_num > 0) {
+  //   std::cerr << std::fixed << std::setprecision(3)
+  //             << "Total inference time : " << total_inference_us / 1000.0 << " ms\n"
+  //             << "Average time/reading : " << total_inference_us / row_num / 1000.0 << " ms\n";
+  // }
   return EXIT_SUCCESS;
 }
 

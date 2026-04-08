@@ -47,6 +47,8 @@ inference_app.ipynb. Every arithmetic operation matches the Python:
 #include "tensorflow/lite/kernels/register.h"
 #include "tensorflow/lite/optional_debug_tools.h"
 
+#include <dlfcn.h>  // dlopen / dlsym — for loading libtensorflowlite_flex.so at runtime
+
 namespace tflite {
 namespace anomaly_detection {
 
@@ -140,23 +142,16 @@ AnomalyInferenceEngine::AnomalyInferenceEngine(const std::string& config_path,
 
   // Dense models are always required
   LoadInterpreter(cfg_.cpu_model.tflite_file,    dense_cpu_fb_, dense_cpu_interp_,
-                  &dense_cpu_ext_delegate_, verbose_);
+                  false, nullptr, &dense_cpu_ext_delegate_, verbose_);
   LoadInterpreter(cfg_.memory_model.tflite_file, dense_mem_fb_, dense_mem_interp_,
-                  &dense_mem_ext_delegate_, verbose_);
+                  false, nullptr, &dense_mem_ext_delegate_, verbose_);
 
-  // LSTM models are optional. flex_delegate=false means the TFLite converter
-  // successfully emitted op 44 (kTfLiteBuiltinUnidirectionalSequenceLstm) and
-  // the bstorm hardware delegate can be applied. flex_delegate=true means Flex ops
-  // are present (LSTM optimizer did not fire); the model runs on CPU only —
-  // passing nullptr suppresses the hardware delegate for that interpreter.
+  // LSTM models are optional — they use SELECT_TF_OPS (Flex delegate)
   if (cfg_.has_lstm_cpu) {
     try {
-      TfLiteDelegateUniquePtr* del =
-          cfg_.lstm_cpu_model.flex_delegate ? nullptr : &lstm_cpu_ext_delegate_;
-      if (cfg_.lstm_cpu_model.flex_delegate)
-        std::cerr << "[delegate] LSTM CPU: flex_delegate=true — running on CPU (no bstorm).\n";
       LoadInterpreter(cfg_.lstm_cpu_model.tflite_file, lstm_cpu_fb_, lstm_cpu_interp_,
-                      del, verbose_);
+                      cfg_.lstm_cpu_model.flex_delegate, &lstm_cpu_delegate_,
+                      &lstm_cpu_ext_delegate_, verbose_);
     } catch (const std::exception& e) {
       std::cerr << "Warning: could not load lstm_cpu_model — " << e.what() << "\n";
       cfg_.has_lstm_cpu = false;
@@ -164,12 +159,9 @@ AnomalyInferenceEngine::AnomalyInferenceEngine(const std::string& config_path,
   }
   if (cfg_.has_lstm_mem) {
     try {
-      TfLiteDelegateUniquePtr* del =
-          cfg_.lstm_memory_model.flex_delegate ? nullptr : &lstm_mem_ext_delegate_;
-      if (cfg_.lstm_memory_model.flex_delegate)
-        std::cerr << "[delegate] LSTM Mem: flex_delegate=true — running on CPU (no bstorm).\n";
       LoadInterpreter(cfg_.lstm_memory_model.tflite_file, lstm_mem_fb_, lstm_mem_interp_,
-                      del, verbose_);
+                      cfg_.lstm_memory_model.flex_delegate, &lstm_mem_delegate_,
+                      &lstm_mem_ext_delegate_, verbose_);
     } catch (const std::exception& e) {
       std::cerr << "Warning: could not load lstm_memory_model — " << e.what() << "\n";
       cfg_.has_lstm_mem = false;
@@ -185,6 +177,8 @@ void AnomalyInferenceEngine::LoadInterpreter(
     const std::string& path,
     std::unique_ptr<tflite::FlatBufferModel>& fb_out,
     std::unique_ptr<tflite::Interpreter>& interp_out,
+    bool use_flex_delegate,
+    TfLiteDelegateUniquePtr* delegate_out,
     TfLiteDelegateUniquePtr* ext_delegate_out,
     bool verbose) {
 
@@ -198,9 +192,11 @@ void AnomalyInferenceEngine::LoadInterpreter(
     throw std::runtime_error("Failed to build interpreter for: " + path);
 
   // Apply external hardware delegate if a path was provided.
-  // Pass nullptr for ext_delegate_out to suppress the hardware delegate
-  // for a specific model (e.g. LSTM when Flex ops are present — CPU fallback).
-  if (!delegate_path_.empty() && ext_delegate_out != nullptr) {
+  // Skipped for Flex-delegate models (LSTM): those use SELECT_TF_OPS which
+  // the hardware delegate does not support, and presenting an unsupported op
+  // graph to it causes a hard assert in the delegate core rather than a
+  // graceful fallback.
+  if (!delegate_path_.empty() && !use_flex_delegate) {
     TfLiteExternalDelegateOptions opts =
         TfLiteExternalDelegateOptionsDefault(delegate_path_.c_str());
 
@@ -250,6 +246,41 @@ void AnomalyInferenceEngine::LoadInterpreter(
           TfLiteExternalDelegateDelete(raw);
       }
     }
+  }
+
+  // Apply the Flex delegate for models that use SELECT_TF_OPS
+  // (e.g. LSTM models — UnidirectionalSequenceLSTM is not a TFLite builtin).
+  // The flex delegate shared library is loaded dynamically at runtime so that
+  // anomaly_app does NOT need to link the full TF runtime at build time.
+  if (use_flex_delegate) {
+    void* flex_lib = dlopen("libtensorflowlite_flex.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!flex_lib)
+      throw std::runtime_error(
+          "dlopen(libtensorflowlite_flex.so) failed: " + std::string(dlerror()) +
+          "\nDeploy libtensorflowlite_flex.so on the target and set LD_LIBRARY_PATH.");
+
+    // TF_AcquireFlexDelegate() is the stable C export from libtensorflowlite_flex.so.
+    // It returns TfLiteDelegateUniquePtr (== std::unique_ptr<TfLiteDelegate, void(*)(TfLiteDelegate*)>).
+    using AcquireFn = TfLiteDelegateUniquePtr (*)();
+    auto* acquire = reinterpret_cast<AcquireFn>(dlsym(flex_lib, "TF_AcquireFlexDelegate"));
+    if (!acquire) {
+      dlclose(flex_lib);
+      throw std::runtime_error(
+          "Symbol TF_AcquireFlexDelegate not found in libtensorflowlite_flex.so");
+    }
+
+    auto flex_delegate = acquire();
+    if (!flex_delegate) {
+      dlclose(flex_lib);
+      throw std::runtime_error("TF_AcquireFlexDelegate() returned null for: " + path);
+    }
+    if (interp_out->ModifyGraphWithDelegate(flex_delegate.get()) != kTfLiteOk) {
+      dlclose(flex_lib);
+      throw std::runtime_error("Failed to apply Flex delegate for: " + path);
+    }
+    if (delegate_out) *delegate_out = std::move(flex_delegate);
+    // Do NOT dlclose(flex_lib) — the delegate's deleter fn lives inside the SO;
+    // the SO must stay loaded for the process lifetime. The OS reclaims it at exit.
   }
 
   interp_out->SetNumThreads(num_threads_);
@@ -405,12 +436,6 @@ float AnomalyInferenceEngine::RunLstmInference(
     for (int c = 0; c < n_features; ++c) in_ptr[offset++] = row[c];
   }
 
-  // Reset LSTM variable tensors (h_state, c_state at op inputs 18 & 19) to zero
-  // before each call. Without this, the hidden/cell state from the previous
-  // Invoke() persists, so each sequence would be processed with a non-zero
-  // initial state from the last reading — corrupting the reconstruction MSE.
-  // This is a no-op if the model has no variable tensors.
-  interp->ResetVariableTensors();
   interp->Invoke();
 
   const float* out_ptr = interp->typed_tensor<float>(out_idx);

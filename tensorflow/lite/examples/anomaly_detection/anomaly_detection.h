@@ -40,7 +40,8 @@ Four TFLite models are supported:
 
 #include "tensorflow/lite/interpreter.h"
 #include "tensorflow/lite/model_builder.h"
-// Provides TfLiteDelegateUniquePtr for managing hardware/external delegate lifetimes.
+// Provides TfLiteDelegateUniquePtr without pulling in the full TF runtime.
+// The flex delegate itself is loaded dynamically via dlopen at runtime.
 #include "tensorflow/lite/delegates/utils/simple_delegate.h"
 // External delegate API — used to load hardware accelerators (e.g. BStorm NPU)
 // via --delegate-path at runtime, matching the label_image --external_delegate_path pattern.
@@ -171,6 +172,11 @@ class AnomalyInferenceEngine {
   std::unique_ptr<tflite::Interpreter> dense_mem_interp_;
   std::unique_ptr<tflite::Interpreter> lstm_cpu_interp_;
   std::unique_ptr<tflite::Interpreter> lstm_mem_interp_;
+  // Flex delegates for LSTM models — must outlive their interpreters.
+  // Initialized with {nullptr, nullptr} because TfLiteDelegateUniquePtr uses
+  // a raw function pointer deleter which has no default constructor.
+  TfLiteDelegateUniquePtr lstm_cpu_delegate_{nullptr, nullptr};
+  TfLiteDelegateUniquePtr lstm_mem_delegate_{nullptr, nullptr};
   // External (hardware) delegates — one per interpreter, must outlive the interpreter.
   TfLiteDelegateUniquePtr dense_cpu_ext_delegate_{nullptr, nullptr};
   TfLiteDelegateUniquePtr dense_mem_ext_delegate_{nullptr, nullptr};
@@ -183,12 +189,14 @@ class AnomalyInferenceEngine {
   // ── Helpers ────────────────────────────────────────────────────────────────
   DeviceState& GetState(const std::string& mac);
 
+  // use_flex_delegate=true required for LSTM models (flex_delegate: true in config)
+  // because UnidirectionalSequenceLSTM is a SELECT_TF_OPS op, not a TFLite builtin.
   // ext_delegate_out receives ownership of the external hardware delegate (if any).
-  // All four models (dense and LSTM) use standard TFLite builtin ops — unrolled LSTM
-  // eliminates While/Fill/Variant ops so the hardware delegate applies to all of them.
   void LoadInterpreter(const std::string& path,
                        std::unique_ptr<tflite::FlatBufferModel>& fb_out,
                        std::unique_ptr<tflite::Interpreter>& interp_out,
+                       bool use_flex_delegate = false,
+                       TfLiteDelegateUniquePtr* delegate_out = nullptr,
                        TfLiteDelegateUniquePtr* ext_delegate_out = nullptr,
                        bool verbose = false);
 

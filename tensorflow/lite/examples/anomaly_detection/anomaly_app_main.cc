@@ -17,35 +17,68 @@ anomaly_app_main.cc
 ────────────────────────────────────────────────────────────────────────────
 Command-line entry point for the DOCSIS gateway anomaly detection engine.
 
+Modes
+-----
+  File-watcher (default)  — no --input given
+    Watches the on-device CSV for new rows via inotify (Linux) or stat-
+    polling (non-Linux) and appends anomaly results continuously.
+    Run in the background with '&'.
+
+  Batch                   — --input <path> given
+    One-shot: reads a complete CSV, writes results, then exits.
+
 Usage:
   anomaly_app [options]
 
-Options:
-  --config,     -c  <path>   Path to inference_config.json
-                             (default: inference_config.json)
-  --input,      -i  <path>   Path to input CSV file
-                             (default: reads CSV from stdin)
-  --output,     -o  <path>   Path to output CSV  (default: stdout)
-  --threads,    -t  <n>      Number of TFLite threads (default: 1)
-  --delegate-path,  -d <path>  Path to external hardware delegate .so
-                             (e.g. /usr/lib/libbstorm_external_delegate.so)
-  --delegate-options  <str>  Semicolon-separated key:value options for the delegate
-                             (e.g. "bstm:1;bstm-client-mode:0;dynamic-tensors:1")
-  --verbose,    -v           Print per-reading details
-  --check-libs               Check shared library availability and exit
-  --help,       -h           Print this message
+General options:
+  --config,  -c <path>   Path to inference_config.json
+                         (default: inference_config.json)
+  --threads, -t <n>      TFLite thread count (default: 1)
+  --delegate-path,  -d <path>
+                         External hardware delegate .so
+                         (e.g. /usr/lib/libbstorm_external_delegate.so)
+  --delegate-options <str>
+                         Semicolon-separated key:value delegate options
+                         (e.g. "bstm:1;bstm-client-mode:0;dynamic-tensors:1")
+  --verbose, -v          Print per-reading details to stderr
+  --check-libs           Check shared library availability and exit
+  --help,    -h          Print this message
 
-CSV input columns (same names as cleaned_data_50mac_xb10_8_3p5s1.csv):
-  timestamp, CMMAC, USED_CPU_ATOM, LOAD_AVG_ATOM,
-  USED_MEM_ATOM_kB, AvailMem_kB, FreeMem_kB, SlabMem_kB,
-  2G_Clients_Count, 5G_Clients_Count, 6G_Clients_Count
+File-watcher options (used when no --input is given):
+  --watch-path  <path>   Device CSV file to monitor
+                         (default: /rdklogs/logs/system_stats_data.csv)
+  --result-path <path>   Output file; result rows are appended
+                         (default: /rdklogs/logs/anomaly_results.csv)
+  --poll-interval <ms>   inotify safety-timeout on Linux; stat-poll interval
+                         on non-Linux (default: 60000 ms)
+  --skip-existing        Seek to EOF on startup; skip rows already present
+
+Batch options (used when --input is given):
+  --input,  -i <path>    Input CSV file
+  --output, -o <path>    Output CSV file (default: stdout)
+
+CSV header is auto-detected in both modes:
+  - First field starts with a letter → column-name header row present
+  - First field starts with a digit  → no header; positional order assumed:
+      col 0: timestamp          col 1: CMMAC
+      col 2: USED_CPU_ATOM      col 3: USED_MEM_ATOM_kB
+      col 4: LOAD_AVG_ATOM      col 5: AvailMem_kB
+      col 6: FreeMem_kB         col 7: SlabMem_kB
+      col 8: 2G_Clients_Count   col 9: 5G_Clients_Count
+      col10: 6G_Clients_Count
+
+Timestamp formats accepted (hour_of_day / day_of_week are derived automatically):
+  YYYY-MM-DDTHH:MM:SS[.mmm]   (ISO 8601)
+  YYYY-MM-DD HH:MM:SS[.mmm]   (space separator)
+  YYYY-MM-DD-HH:MM:SS[.mmm]   (device /rdklogs format)
 
 Output CSV columns:
-  timestamp, CMMAC, dense_cpu_mse, dense_mem_mse,
-  dense_cpu_flag, dense_mem_flag, dense_cpu_sev, dense_mem_sev,
+  timestamp, CMMAC,
+  dense_cpu_mse, dense_mem_mse, dense_cpu_flag, dense_mem_flag,
+  dense_cpu_sev, dense_mem_sev,
   [lstm_cpu_mse, lstm_mem_mse, lstm_cpu_flag, lstm_mem_flag,
-   lstm_cpu_sev, lstm_mem_sev,]
-  anomaly_type
+   lstm_cpu_sev, lstm_mem_sev,]   ← only when LSTM models are loaded
+  anomaly_type   ∈ {Normal, CPU, Memory, Both}
 ============================================================================*/
 
 #include "tensorflow/lite/examples/anomaly_detection/anomaly_detection.h"
@@ -64,7 +97,6 @@ Output CSV columns:
 #include <vector>
 
 #include <dlfcn.h>          // dlopen / dlsym — for runtime flex delegate check
-#include <fcntl.h>          // open, O_RDWR
 #include <signal.h>         // signal, SIGTERM, SIGINT, sig_atomic_t
 #include <sys/stat.h>       // stat, struct stat
 #include <unistd.h>         // fork, setsid, dup2, getpid, usleep
@@ -222,38 +254,6 @@ static void WriteResultRow(std::ostream& out,
 static volatile sig_atomic_t g_stop = 0;
 static void OnSignal(int) { g_stop = 1; }
 
-// ── Daemonize (POSIX double-fork) ─────────────────────────────────────────────
-// Forks the process into the background and redirects stdio to /dev/null.
-// Optionally writes the daemon PID to pid_file.
-static void Daemonize(const std::string& pid_file) {
-  // First fork — detach from the controlling terminal
-  pid_t pid = fork();
-  if (pid < 0) { perror("[daemon] fork");  exit(1); }
-  if (pid > 0) exit(0);  // parent exits immediately
-
-  setsid();  // become a session leader with no controlling terminal
-
-  // Second fork — prevent re-acquiring a terminal
-  pid = fork();
-  if (pid < 0) { perror("[daemon] fork2"); exit(1); }
-  if (pid > 0) exit(0);  // first child exits
-
-  // Redirect stdio to /dev/null
-  int devnull = open("/dev/null", O_RDWR);
-  if (devnull >= 0) {
-    dup2(devnull, STDIN_FILENO);
-    dup2(devnull, STDOUT_FILENO);
-    dup2(devnull, STDERR_FILENO);
-    if (devnull > STDERR_FILENO) close(devnull);
-  }
-
-  // Write PID file so the init system / watchdog can manage the process
-  if (!pid_file.empty()) {
-    FILE* pf = fopen(pid_file.c_str(), "w");
-    if (pf) { fprintf(pf, "%d\n", static_cast<int>(getpid())); fclose(pf); }
-  }
-}
-
 // ── Column index bundle ───────────────────────────────────────────────────────
 // Parsed once from the CSV header; reused for every data row.
 struct ColIdx {
@@ -341,20 +341,21 @@ static TelemetryReading ParseRow(const std::vector<std::string>& fields,
   return rdg;
 }
 
-// ── Daemon watch loop ─────────────────────────────────────────────────────────
-// Monitors watch_path for newly-appended CSV rows using stat()-based polling.
-// Results are appended to result_path.  Runs until SIGTERM or SIGINT.
+// ── File-watcher loop ────────────────────────────────────────────────────────
+// Monitors watch_path for newly-appended CSV rows via inotify (Linux) or
+// stat-polling (non-Linux). Results are appended to result_path.
+// Runs until SIGTERM or SIGINT.
 //
 // skip_existing=true  → seek to EOF on open; ignore rows already in the file.
 // skip_existing=false → process all rows present at startup, then watch.
-// no_header=true      → file has no column-name header; use positional mapping.
+// Header detection is automatic: if the first byte of the file is a digit
+// (timestamp) it has no header row and positional column mapping is used.
 static int RunDaemon(AnomalyInferenceEngine& engine,
                      const std::string& watch_path,
                      const std::string& result_path,
                      int poll_ms,
                      bool verbose,
-                     bool skip_existing,
-                     bool no_header) {
+                     bool skip_existing) {
   signal(SIGTERM, OnSignal);
   signal(SIGINT,  OnSignal);
 
@@ -386,24 +387,28 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
     fin.open(watch_path);
     if (!fin.is_open()) return false;
 
-    if (no_header) {
-      // Device CSV has no header row — use fixed positional column mapping.
-      ci.ParsePositional();
-      cols.clear();  // not used in positional mode
-      last_pos = fin.tellg();
-      return true;
-    }
+    // Auto-detect header: peek at the first byte.
+    // A timestamp starts with a digit (device CSV, no header).
+    // A named-column header starts with a letter.
+    const bool has_named_header =
+        fin.good() && std::isalpha(static_cast<unsigned char>(fin.peek()));
 
-    std::string hdr;
-    if (!std::getline(fin, hdr)) return false;
-    cols = SplitCsv(hdr);
-    if (!ci.Parse(cols)) {
-      std::cerr << "[daemon] Required columns (timestamp, CMMAC) missing in: "
-                << watch_path << "\n";
-      fin.close();
-      return false;
+    if (has_named_header) {
+      std::string hdr;
+      if (!std::getline(fin, hdr)) return false;
+      cols = SplitCsv(hdr);
+      if (!ci.Parse(cols)) {
+        std::cerr << "[daemon] Required columns (timestamp, CMMAC) missing in: "
+                  << watch_path << "\n";
+        fin.close();
+        return false;
+      }
+      last_pos = fin.tellg();  // position after the header line
+    } else {
+      ci.ParsePositional();
+      cols.clear();             // empty cols signals positional mode to DrainFile
+      last_pos = fin.tellg();   // position at start of first data row
     }
-    last_pos = fin.tellg();
     return true;
   };
 
@@ -430,9 +435,8 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
     while (std::getline(fin, line)) {
       if (line.empty()) continue;
       std::vector<std::string> fields = SplitCsv(line);
-      // Skip rows shorter than the header (partial writes) or, in
-      // positional/no-header mode, rows with fewer than 9 fields.
-      const int min_f = no_header ? 9 : static_cast<int>(cols.size());
+      // cols.empty() means positional mode (auto-detected, no header row).
+      const int min_f = cols.empty() ? 9 : static_cast<int>(cols.size());
       if (static_cast<int>(fields.size()) < min_f) continue;
       TelemetryReading rdg = ParseRow(fields, cols, ci);
       AnomalyResult    res = engine.ProcessReading(rdg);
@@ -608,11 +612,7 @@ static void PrintUsage(const char* prog) {
     << "  --verbose,  -v          Print per-reading details to stderr\n"
     << "  --check-libs            Check shared library availability and exit\n"
     << "  --help,     -h          Print this message\n\n"
-    << "Daemon mode (long-running file watcher):\n"
-    << "  --daemon                Watch watch-path for new rows; process continuously\n"
-    << "                          until SIGTERM/SIGINT.\n"
-    << "  --daemonize             Fork to background (implies --daemon);\n"
-    << "                          stdio is redirected to /dev/null.\n"
+    << "File-watcher mode (default; runs until SIGTERM/SIGINT, use '&' to background):\n"
     << "  --watch-path  <path>    CSV produced by the data-collection process.\n"
     << "                          (default: /rdklogs/logs/system_stats_data.csv)\n"
     << "  --result-path <path>    Output file; results are appended.\n"
@@ -620,13 +620,12 @@ static void PrintUsage(const char* prog) {
     << "  --poll-interval <ms>    On Linux (inotify mode): safety-timeout in ms; wakes\n"
     << "                          even if an inotify event was missed. (default: 60000)\n"
     << "                          On non-Linux: active stat-poll interval in ms.\n"
-    << "  --skip-existing         Start from EOF; ignore rows already in watch-path.\n"
-    << "  --pid-file    <path>    Write daemon PID here (--daemonize only).\n"
-    << "  --no-header             watch-path has no column-name header row;\n"
-    << "                          use fixed positional column order:\n"
-    << "                          timestamp,CMMAC,USED_CPU_ATOM,USED_MEM_ATOM_kB,\n"
-    << "                          LOAD_AVG_ATOM,AvailMem_kB,FreeMem_kB,SlabMem_kB,\n"
-    << "                          2G_Clients_Count,5G_Clients_Count,6G_Clients_Count\n\n";
+    << "  --skip-existing         Start from EOF; ignore rows already in watch-path.\n\n"
+    << "  CSV header is auto-detected: if the first field starts with a letter it\n"
+    << "  is treated as a column-name header row; if it starts with a digit the\n"
+    << "  file has no header and this positional order is assumed:\n"
+    << "    0:timestamp  1:CMMAC  2:USED_CPU_ATOM  3:USED_MEM_ATOM_kB  4:LOAD_AVG_ATOM\n"
+    << "    5:AvailMem_kB  6:FreeMem_kB  7:SlabMem_kB  8:2G  9:5G  10:6G_Clients_Count\n\n";
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -639,14 +638,10 @@ int Main(int argc, char** argv) {
   int  num_threads     = 1;
   bool verbose         = false;
   bool check_libs      = false;
-  // ── Daemon mode options ───────────────────────────────────────────────────
-  bool daemon_mode     = false;
-  bool daemonize       = false;
-  bool skip_existing   = false;
-  bool no_header       = false;  // device CSV has no column-name header row
+  // ── File-watcher options ──────────────────────────────────────────────────
+  bool skip_existing    = false;
   std::string watch_path    = "/rdklogs/logs/system_stats_data.csv";
   std::string result_path   = "/rdklogs/logs/anomaly_results.csv";
-  std::string pid_file;
   int  poll_interval_ms = 60000;  // inotify safety timeout; non-Linux poll interval
 
   // ── Parse arguments ───────────────────────────────────────────────────────
@@ -668,15 +663,8 @@ int Main(int argc, char** argv) {
       delegate_options = argv[++i];
     } else if (arg == "--verbose" || arg == "-v") {
       verbose = true;
-    } else if (arg == "--daemon") {
-      daemon_mode = true;
-    } else if (arg == "--daemonize") {
-      daemonize   = true;
-      daemon_mode = true;
     } else if (arg == "--skip-existing") {
       skip_existing = true;
-    } else if (arg == "--no-header") {
-      no_header = true;
     } else if (arg == "--watch-path" && i + 1 < argc) {
       watch_path = argv[++i];
     } else if (arg == "--result-path" && i + 1 < argc) {
@@ -684,8 +672,6 @@ int Main(int argc, char** argv) {
     } else if (arg == "--poll-interval" && i + 1 < argc) {
       poll_interval_ms = std::atoi(argv[++i]);
       if (poll_interval_ms <= 0) poll_interval_ms = 60000;
-    } else if (arg == "--pid-file" && i + 1 < argc) {
-      pid_file = argv[++i];
     } else if (arg == "--help" || arg == "-h") {
       PrintUsage(argv[0]);
       return EXIT_SUCCESS;
@@ -711,21 +697,15 @@ int Main(int argc, char** argv) {
   std::cerr << "Engine ready.  SEQ_LEN=" << engine.seq_len()
             << "  threads=" << num_threads << "\n";
 
-  // ── Daemon mode ────────────────────────────────────────────────────────────
-  if (daemon_mode) {
-    std::cerr << "[daemon] watch-path  : " << watch_path      << "\n"
-              << "[daemon] result-path : " << result_path     << "\n"
-              << "[daemon] timeout(ms) : " << poll_interval_ms
+  // ── Dispatch: watch mode (default) or batch mode (--input) ───────────────
+  if (input_path.empty()) {
+    std::cerr << "[watcher] watch-path  : " << watch_path      << "\n"
+              << "[watcher] result-path : " << result_path     << "\n"
+              << "[watcher] timeout(ms) : " << poll_interval_ms
               << " (inotify safety timeout on Linux; poll interval on non-Linux)\n"
-              << "[daemon] skip-existing: " << (skip_existing ? "yes" : "no") << "\n"
-              << "[daemon] no-header    : " << (no_header     ? "yes" : "no") << "\n";
-    if (daemonize) {
-      std::cerr << "[daemon] Forking to background...\n";
-      Daemonize(pid_file);
-      // stderr is now /dev/null; all subsequent diagnostics are silent
-    }
+              << "[watcher] skip-existing: " << (skip_existing ? "yes" : "no") << "\n";
     return RunDaemon(engine, watch_path, result_path,
-                     poll_interval_ms, verbose, skip_existing, no_header);
+                     poll_interval_ms, verbose, skip_existing);
   }
 
   // ── Open I/O streams ──────────────────────────────────────────────────────
@@ -743,25 +723,27 @@ int Main(int argc, char** argv) {
   }
   std::ostream& out = fout.is_open() ? fout : std::cout;
 
-  // ── Parse CSV header / column mapping ────────────────────────────────────
+  // ── Parse CSV header / column mapping (auto-detect) ─────────────────────
+  // Peek at the first byte: a digit means the first row is data (no header);
+  // a letter means a named-column header row is present.
   ColIdx batch_ci;
   std::vector<std::string> cols;
 
-  if (no_header) {
-    // Device CSV has no column-name header; use fixed positional mapping.
-    batch_ci.ParsePositional();
-  } else {
+  if (!in.good()) {
+    std::cerr << "Input is empty.\n";
+    return EXIT_FAILURE;
+  }
+  if (std::isalpha(static_cast<unsigned char>(in.peek()))) {
     std::string header_line;
-    if (!std::getline(in, header_line)) {
-      std::cerr << "Input is empty.\n";
-      return EXIT_FAILURE;
-    }
+    std::getline(in, header_line);
     cols = SplitCsv(header_line);
     if (!batch_ci.Parse(cols)) {
-      std::cerr << "Cannot find required columns (timestamp, CMMAC) in header.\n"
-                << "If the file has no header, use --no-header.\n";
+      std::cerr << "Cannot find required columns (timestamp, CMMAC) in header.\n";
       return EXIT_FAILURE;
     }
+  } else {
+    batch_ci.ParsePositional();
+    // Stream stays at the first data row; the loop below will consume it.
   }
 
   // Convenience aliases so the rest of batch mode is unchanged
@@ -812,10 +794,8 @@ int Main(int argc, char** argv) {
   while (std::getline(in, line)) {
     if (line.empty()) continue;
     std::vector<std::string> fields = SplitCsv(line);
-    // In named-column mode require at least as many fields as the header.
-    // In positional (no-header) mode require at least 9 fields (up to 6G col).
-    const int min_fields = no_header ? 9
-                         : static_cast<int>(cols.size());
+    // cols.empty() means positional mode (auto-detected, no header row).
+    const int min_fields = cols.empty() ? 9 : static_cast<int>(cols.size());
     if (static_cast<int>(fields.size()) < min_fields) continue;
 
     auto F = [&](int idx, float def = 0.0f) -> float {

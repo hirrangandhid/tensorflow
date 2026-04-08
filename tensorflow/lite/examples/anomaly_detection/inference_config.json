@@ -1,0 +1,215 @@
+{
+  "rolling_window": 10,
+  "cpu_model": {
+    "tflite_file": "cpu_anomaly_model.tflite",
+    "feature_order": [
+      "USED_CPU_ATOM",
+      "LOAD_AVG_ATOM",
+      "load_cpu_divergence",
+      "cpu_delta",
+      "cpu_rolling_mean",
+      "cpu_rolling_std",
+      "slab_pressure",
+      "total_clients",
+      "hour_of_day",
+      "day_of_week"
+    ],
+    "scaler": {
+      "data_min": {
+        "USED_CPU_ATOM": 3.0,
+        "LOAD_AVG_ATOM": 0.06,
+        "load_cpu_divergence": -42.12,
+        "cpu_delta": -11.0,
+        "cpu_rolling_mean": 3.0,
+        "cpu_rolling_std": 0.0,
+        "slab_pressure": 0.0457,
+        "total_clients": 0.0,
+        "hour_of_day": 0.0,
+        "day_of_week": 0.0
+      },
+      "data_max": {
+        "USED_CPU_ATOM": 44.0,
+        "LOAD_AVG_ATOM": 2.27,
+        "load_cpu_divergence": -2.61,
+        "cpu_delta": 16.09,
+        "cpu_rolling_mean": 35.579,
+        "cpu_rolling_std": 12.4787,
+        "slab_pressure": 0.0601,
+        "total_clients": 27.0,
+        "hour_of_day": 23.0,
+        "day_of_week": 6.0
+      },
+      "scale": {
+        "USED_CPU_ATOM": 0.024390243902439025,
+        "LOAD_AVG_ATOM": 0.45248868778280543,
+        "load_cpu_divergence": 0.02531004808909137,
+        "cpu_delta": 0.0369139904023625,
+        "cpu_rolling_mean": 0.03069461923324841,
+        "cpu_rolling_std": 0.08013655268577656,
+        "slab_pressure": 69.44444444444443,
+        "total_clients": 0.037037037037037035,
+        "hour_of_day": 0.043478260869565216,
+        "day_of_week": 0.16666666666666666
+      }
+    },
+    "anomaly_threshold": 0.0026691509410738945
+  },
+  "memory_model": {
+    "tflite_file": "memory_anomaly_model.tflite",
+    "feature_order": [
+      "USED_MEM_ATOM_kB",
+      "AvailMem_kB",
+      "FreeMem_kB",
+      "SlabMem_kB",
+      "memory_util_ratio",
+      "slab_pressure",
+      "free_mem_ratio",
+      "hour_of_day",
+      "day_of_week"
+    ],
+    "scaler": {
+      "data_min": {
+        "USED_MEM_ATOM_kB": 450284.0,
+        "AvailMem_kB": 1783968.0,
+        "FreeMem_kB": 1403400.0,
+        "SlabMem_kB": 86984.0,
+        "memory_util_ratio": 0.1906,
+        "slab_pressure": 0.0457,
+        "free_mem_ratio": 0.7835,
+        "hour_of_day": 0.0,
+        "day_of_week": 0.0
+      },
+      "data_max": {
+        "USED_MEM_ATOM_kB": 579924.0,
+        "AvailMem_kB": 1914704.0,
+        "FreeMem_kB": 1547716.0,
+        "SlabMem_kB": 109532.0,
+        "memory_util_ratio": 0.2449,
+        "slab_pressure": 0.0601,
+        "free_mem_ratio": 0.8239,
+        "hour_of_day": 23.0,
+        "day_of_week": 6.0
+      },
+      "scale": {
+        "USED_MEM_ATOM_kB": 7.71366862079605e-06,
+        "AvailMem_kB": 7.649002570064864e-06,
+        "FreeMem_kB": 6.929238615260955e-06,
+        "SlabMem_kB": 4.434983147064041e-05,
+        "memory_util_ratio": 18.416206261510123,
+        "slab_pressure": 69.44444444444443,
+        "free_mem_ratio": 24.752475247524757,
+        "hour_of_day": 0.043478260869565216,
+        "day_of_week": 0.16666666666666666
+      }
+    },
+    "anomaly_threshold": 6.269131063163513e-06
+  },
+  "lstm_cpu_model": {
+    "tflite_file": "lstm_cpu_anomaly_model.tflite",
+    "feature_order": [
+      "USED_CPU_ATOM",
+      "LOAD_AVG_ATOM",
+      "load_cpu_divergence",
+      "cpu_delta",
+      "cpu_rolling_mean",
+      "cpu_rolling_std",
+      "slab_pressure",
+      "total_clients",
+      "hour_of_day",
+      "day_of_week"
+    ],
+    "seq_len": 10,
+    "flex_delegate": true,
+    "scaler": {
+      "data_min": {
+        "USED_CPU_ATOM": 3.0,
+        "LOAD_AVG_ATOM": 0.06,
+        "load_cpu_divergence": -42.12,
+        "cpu_delta": -11.0,
+        "cpu_rolling_mean": 3.0,
+        "cpu_rolling_std": 0.0,
+        "slab_pressure": 0.0457,
+        "total_clients": 0.0,
+        "hour_of_day": 0.0,
+        "day_of_week": 0.0
+      },
+      "data_max": {
+        "USED_CPU_ATOM": 44.0,
+        "LOAD_AVG_ATOM": 2.27,
+        "load_cpu_divergence": -2.61,
+        "cpu_delta": 16.09,
+        "cpu_rolling_mean": 35.579,
+        "cpu_rolling_std": 12.4787,
+        "slab_pressure": 0.0601,
+        "total_clients": 27.0,
+        "hour_of_day": 23.0,
+        "day_of_week": 6.0
+      },
+      "scale": {
+        "USED_CPU_ATOM": 0.024390243902439025,
+        "LOAD_AVG_ATOM": 0.45248868778280543,
+        "load_cpu_divergence": 0.02531004808909137,
+        "cpu_delta": 0.0369139904023625,
+        "cpu_rolling_mean": 0.03069461923324841,
+        "cpu_rolling_std": 0.08013655268577656,
+        "slab_pressure": 69.44444444444443,
+        "total_clients": 0.037037037037037035,
+        "hour_of_day": 0.043478260869565216,
+        "day_of_week": 0.16666666666666666
+      }
+    },
+    "anomaly_threshold": 0.0023531762417405844
+  },
+  "lstm_memory_model": {
+    "tflite_file": "lstm_memory_anomaly_model.tflite",
+    "feature_order": [
+      "USED_MEM_ATOM_kB",
+      "AvailMem_kB",
+      "FreeMem_kB",
+      "SlabMem_kB",
+      "memory_util_ratio",
+      "slab_pressure",
+      "free_mem_ratio",
+      "hour_of_day",
+      "day_of_week"
+    ],
+    "seq_len": 10,
+    "flex_delegate": true,
+    "scaler": {
+      "data_min": {
+        "USED_MEM_ATOM_kB": 450284.0,
+        "AvailMem_kB": 1783968.0,
+        "FreeMem_kB": 1403400.0,
+        "SlabMem_kB": 86984.0,
+        "memory_util_ratio": 0.1906,
+        "slab_pressure": 0.0457,
+        "free_mem_ratio": 0.7835,
+        "hour_of_day": 0.0,
+        "day_of_week": 0.0
+      },
+      "data_max": {
+        "USED_MEM_ATOM_kB": 579924.0,
+        "AvailMem_kB": 1914704.0,
+        "FreeMem_kB": 1547716.0,
+        "SlabMem_kB": 109532.0,
+        "memory_util_ratio": 0.2449,
+        "slab_pressure": 0.0601,
+        "free_mem_ratio": 0.8239,
+        "hour_of_day": 23.0,
+        "day_of_week": 6.0
+      },
+      "scale": {
+        "USED_MEM_ATOM_kB": 7.71366862079605e-06,
+        "AvailMem_kB": 7.649002570064864e-06,
+        "FreeMem_kB": 6.929238615260955e-06,
+        "SlabMem_kB": 4.434983147064041e-05,
+        "memory_util_ratio": 18.416206261510123,
+        "slab_pressure": 69.44444444444443,
+        "free_mem_ratio": 24.752475247524757,
+        "hour_of_day": 0.043478260869565216,
+        "day_of_week": 0.16666666666666666
+      }
+    },
+    "anomaly_threshold": 0.00031382101587951183
+  }
+}

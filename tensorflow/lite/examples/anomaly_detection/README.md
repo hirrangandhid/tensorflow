@@ -91,12 +91,30 @@ bazel build //tensorflow/lite/examples/anomaly_detection:anomaly_app
 ```
 anomaly_app [options]
 
-  --config,  -c <path>   inference_config.json  (default: inference_config.json)
-  --input,   -i <path>   Input CSV file          (default: stdin)
-  --output,  -o <path>   Output CSV file         (default: stdout)
-  --threads, -t <n>      TFLite thread count     (default: 1)
-  --verbose, -v          Print per-reading details to stderr
-  --help,    -h          Print usage
+  --config,   -c <path>   inference_config.json  (default: inference_config.json)
+  --input,    -i <path>   Input CSV file          (default: stdin)
+  --output,   -o <path>   Output CSV file         (default: stdout)
+  --threads,  -t <n>      TFLite thread count     (default: 1)
+  --delegate-path,  -d <path>
+                          External hardware delegate .so
+  --delegate-options <key:val;key:val>
+                          Options forwarded to the delegate
+  --verbose,  -v          Print per-reading details to stderr
+  --check-libs            Check shared-library availability and exit
+  --help,     -h          Print usage
+
+Daemon mode (long-running file watcher):
+  --daemon                Watch watch-path for new rows; run until SIGTERM/SIGINT
+  --daemonize             Fork to background (implies --daemon)
+  --watch-path  <path>    CSV produced by the data-collection process
+                          (default: /rdklogs/logs/system_stats_data.csv)
+  --result-path <path>    Output file; result rows are appended
+                          (default: /rdklogs/logs/anomaly_results.csv)
+  --poll-interval <ms>    On Linux (inotify mode): safety-timeout — wakes even
+                          if an inotify event was missed (default: 60000 = 60 s).
+                          On non-Linux: active stat-poll interval in ms.
+  --skip-existing         Seek to EOF on startup; only process newly-written rows
+  --pid-file    <path>    Write daemon PID here (--daemonize only)
 ```
 
 ### Input CSV columns
@@ -125,7 +143,7 @@ anomaly_type
 
 `anomaly_type` ∈ `{Normal, CPU, Memory, Both}` — identical to Python output.
 
-### Example
+### One-shot batch example
 
 ```bash
 # Run against the full validation dataset (mirrors notebook Section 8)
@@ -134,6 +152,72 @@ anomaly_type
   --input  cleaned_data_50mac_xb10_8_3p5s1.csv \
   --output results.csv \
   --verbose
+```
+
+---
+
+## Daemon Mode — Live File Watcher
+
+`anomaly_app` can run as a persistent daemon that monitors the CSV file
+written by the on-device telemetry-collection process and produces anomaly
+results in real time.
+
+### How it works
+
+1. On startup the engine loads the TFLite models and config once.
+2. It opens `/rdklogs/logs/system_stats_data.csv`, reads the header, and
+   processes any rows already present (unless `--skip-existing` is set).
+3. **On Linux** it uses `inotify` to watch the file's parent directory.
+   The process sleeps in `poll()` and is woken by the kernel the instant
+   the collector writes — zero polling overhead regardless of the collection
+   interval (5 min, 1 hour, etc.).
+   `--poll-interval` is a safety-timeout only (default 60 s), used to catch
+   any event that might be missed during log rotation.
+   **On non-Linux** (e.g. macOS dev builds) it falls back to stat-based
+   polling using `--poll-interval` as the sleep interval.
+4. When the file grows (or is re-created after rotation) the daemon reads
+   the new rows, runs inference, and **appends** results to the result file.
+5. File rotation / truncation and temporary disappearance are handled
+   automatically.
+6. Send `SIGTERM` or `SIGINT` for a clean shutdown.
+
+### Foreground (supervised by systemd / procd)
+
+```bash
+./anomaly_app \
+  --config /etc/anomaly_detection/inference_config.json \
+  --daemon \
+  --watch-path  /rdklogs/logs/system_stats_data.csv \
+  --result-path /rdklogs/logs/anomaly_results.csv \
+  --poll-interval 60000 \
+  --verbose
+```
+
+### Background (self-daemonizing)
+
+```bash
+./anomaly_app \
+  --config /etc/anomaly_detection/inference_config.json \
+  --daemonize \
+  --watch-path  /rdklogs/logs/system_stats_data.csv \
+  --result-path /rdklogs/logs/anomaly_results.csv \
+  --pid-file    /var/run/anomaly_app.pid
+```
+
+### procd service snippet (OpenWrt / RDK)
+
+```sh
+start_service() {
+    procd_open_instance
+    procd_set_param command /usr/bin/anomaly_app \
+        --config  /etc/anomaly_detection/inference_config.json \
+        --daemon \
+        --watch-path  /rdklogs/logs/system_stats_data.csv \
+        --result-path /rdklogs/logs/anomaly_results.csv \
+        --poll-interval 60000
+    procd_set_param respawn
+    procd_close_instance
+}
 ```
 
 ---

@@ -76,8 +76,6 @@ Output CSV columns:
   timestamp, CMMAC,
   dense_cpu_mse, dense_mem_mse, dense_cpu_flag, dense_mem_flag,
   dense_cpu_sev, dense_mem_sev,
-  [lstm_cpu_mse, lstm_mem_mse, lstm_cpu_flag, lstm_mem_flag,
-   lstm_cpu_sev, lstm_mem_sev,]   ← only when LSTM models are loaded
   anomaly_type   ∈ {Normal, CPU, Memory, Both}
 ============================================================================*/
 
@@ -96,7 +94,6 @@ Output CSV columns:
 #include <unordered_map>
 #include <vector>
 
-#include <dlfcn.h>          // dlopen / dlsym — for runtime flex delegate check
 #include <signal.h>         // signal, SIGTERM, SIGINT, sig_atomic_t
 #include <sys/stat.h>       // stat, struct stat
 #include <unistd.h>         // fork, setsid, dup2, getpid, usleep
@@ -164,67 +161,13 @@ static void ParseTimestamp(const std::string& ts, int& hour, int& dow) {
   }
 }
 
-// ── Flex delegate runtime check ───────────────────────────────────────────────
-// Call this before loading any model to verify libtensorflowlite_flex.so is
-// present and functional on the current device.
-//
-// Returns true if the Flex delegate can be created successfully.
-// Prints a clear diagnostic message either way.
-static bool CheckFlexDelegate() {
-  std::cerr << "\n[lib-check] Testing Flex delegate (required for LSTM models)...\n";
-
-  // Load the flex delegate SO dynamically; not required at link time.
-  void* lib = dlopen("libtensorflowlite_flex.so", RTLD_NOW | RTLD_GLOBAL);
-  bool available = false;
-  if (lib) {
-    using AcquireFn = TfLiteDelegateUniquePtr (*)();
-    auto* acquire = reinterpret_cast<AcquireFn>(dlsym(lib, "TF_AcquireFlexDelegate"));
-    if (acquire) {
-      auto d = acquire();       // destructs at end of this block
-      available = (d != nullptr);
-    }   // d destructs here — deleter called while lib is still open
-    dlclose(lib);               // safe: delegate already destroyed above
-  }
-
-  if (!available) {
-    std::cerr
-      << "[lib-check] FAIL: TfLiteFlexDelegateCreate() returned null.\n"
-      << "            Likely cause: libtensorflowlite_flex.so is not in LD_LIBRARY_PATH\n"
-      << "            or was not deployed alongside the binary.\n"
-      << "            \u2192 LSTM models (lstm_cpu_anomaly_model.tflite,\n"
-      << "                           lstm_memory_anomaly_model.tflite) will NOT work.\n"
-      << "            \u2192 Dense models (cpu_anomaly_model.tflite,\n"
-      << "                            memory_anomaly_model.tflite) are unaffected.\n\n"
-      << "  To fix on target:\n"
-      << "    export LD_LIBRARY_PATH=/path/to/tflite/libs:$LD_LIBRARY_PATH\n"
-      << "    ls $LD_LIBRARY_PATH/libtensorflowlite_flex.so   # must exist\n\n"
-      << "  To verify on host before deploying:\n"
-      << "    readelf -d anomaly_app | grep NEEDED\n"
-      << "    # must show: libtensorflowlite_flex.so\n"
-      << "    aarch64-linux-gnu-readelf -d anomaly_app | grep NEEDED\n\n"
-      << "  To verify on target after copying:\n"
-      << "    ldd ./anomaly_app | grep flex\n"
-      << "    # must show: libtensorflowlite_flex.so => /path/to/lib (0x...)\n"
-      << "    # 'not found' means the .so was not deployed.\n\n";
-    return false;
-  }
-
-  std::cerr << "[lib-check] OK : Flex delegate available \u2014 LSTM models will work.\n\n";
-  return true;
-}
-
 // ── CSV result header writer ─────────────────────────────────────────────────
-static void WriteResultHeader(std::ostream& out, bool with_lstm) {
+static void WriteResultHeader(std::ostream& out) {
   out << "timestamp,CMMAC"
       << ",dense_cpu_mse,dense_mem_mse"
       << ",dense_cpu_flag,dense_mem_flag"
-      << ",dense_cpu_sev,dense_mem_sev";
-  if (with_lstm) {
-    out << ",lstm_cpu_mse,lstm_mem_mse"
-        << ",lstm_cpu_flag,lstm_mem_flag"
-        << ",lstm_cpu_sev,lstm_mem_sev";
-  }
-  out << ",anomaly_type\n";
+      << ",dense_cpu_sev,dense_mem_sev"
+      << ",anomaly_type\n";
 }
 
 // ── CSV result row writer ────────────────────────────────────────────────────
@@ -238,16 +181,8 @@ static void WriteResultRow(std::ostream& out,
       << "," << res.dense_cpu_flag
       << "," << res.dense_mem_flag
       << "," << std::setprecision(4) << res.dense_cpu_sev
-      << "," << res.dense_mem_sev;
-  if (res.has_lstm) {
-    out << "," << std::setprecision(6) << res.lstm_cpu_mse
-        << "," << res.lstm_mem_mse
-        << "," << res.lstm_cpu_flag
-        << "," << res.lstm_mem_flag
-        << "," << std::setprecision(4) << res.lstm_cpu_sev
-        << "," << res.lstm_mem_sev;
-  }
-  out << "," << res.anomaly_type << "\n";
+      << "," << res.dense_mem_sev
+      << "," << res.anomaly_type << "\n";
 }
 
 // ── Signal handling ───────────────────────────────────────────────────────────
@@ -339,6 +274,42 @@ static TelemetryReading ParseRow(const std::vector<std::string>& fields,
     ParseTimestamp(rdg.timestamp, rdg.hour_of_day, rdg.day_of_week);
   }
   return rdg;
+}
+
+// ── Anomaly alert printer ─────────────────────────────────────────────────────
+// Prints a human-readable alert to stderr whenever an anomaly is detected.
+// Called unconditionally (not gated behind --verbose) so alerts are always visible.
+//
+// Output format:
+//   [ANOMALY] <timestamp>  <mac>  Type=<type>
+//     CPU  : MSE=<val>  sev=<val>x  <ANOMALY | normal>
+//     Mem  : MSE=<val>  sev=<val>x  <ANOMALY | normal>
+//     Why  : <explanation of what caused the flag>
+static void PrintAlert(const TelemetryReading& rdg, const AnomalyResult& res) {
+  if (res.anomaly_type == "Normal") return;
+
+  const bool cpu_flag = (res.dense_cpu_flag != 0);
+  const bool mem_flag = (res.dense_mem_flag != 0);
+
+  std::cerr << "\n[ANOMALY] " << rdg.timestamp
+            << "  " << rdg.mac
+            << "  Type=" << res.anomaly_type << "\n";
+
+  // CPU sub-system line
+  std::cerr << "  CPU  : MSE=" << std::fixed << std::setprecision(6) << res.dense_cpu_mse
+            << "  sev=" << std::setprecision(2) << res.dense_cpu_sev << "x";
+  if (cpu_flag)
+    std::cerr << "  <-- ANOMALY (" << std::setprecision(1) << res.dense_cpu_sev << "x worse than normal)";
+  std::cerr << "\n";
+
+  // Memory sub-system line
+  std::cerr << "  Mem  : MSE=" << std::fixed << std::setprecision(6) << res.dense_mem_mse
+            << "  sev=" << std::setprecision(2) << res.dense_mem_sev << "x";
+  if (mem_flag)
+    std::cerr << "  <-- ANOMALY (" << std::setprecision(1) << res.dense_mem_sev << "x worse than normal)";
+  std::cerr << "\n";
+
+  std::cerr << "\n";
 }
 
 // ── File-watcher loop ────────────────────────────────────────────────────────
@@ -441,11 +412,12 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
       TelemetryReading rdg = ParseRow(fields, cols, ci);
       AnomalyResult    res = engine.ProcessReading(rdg);
       if (!header_written) {
-        WriteResultHeader(fout, res.has_lstm);
+        WriteResultHeader(fout);
         header_written = true;
       }
       WriteResultRow(fout, rdg, res);
       fout.flush();
+      PrintAlert(rdg, res);
       if (verbose && res.anomaly_type != "Normal") {
         std::cerr << "[daemon] ALERT "
                   << rdg.mac << " ts=" << rdg.timestamp
@@ -684,11 +656,9 @@ int Main(int argc, char** argv) {
 
   // ── Library presence check (--check-libs flag) ────────────────────────────
   if (check_libs) {
-    std::cerr << "[lib-check] Checking shared library availability...\n";
-    std::cerr << "[lib-check] libtensorflowlite.so       : required for all models\n";
-    std::cerr << "[lib-check] libtensorflowlite_flex.so  : required for LSTM models\n";
-    bool flex_ok = CheckFlexDelegate();
-    return flex_ok ? EXIT_SUCCESS : EXIT_FAILURE;
+    std::cerr << "[lib-check] libtensorflowlite.so is required for all models.\n"
+              << "[lib-check] Use: ldd ./anomaly_app | grep tflite\n";
+    return EXIT_SUCCESS;
   }
 
   // ── Initialise engine ─────────────────────────────────────────────────────
@@ -756,21 +726,14 @@ int Main(int argc, char** argv) {
   const int ci_hour = batch_ci.hour; const int ci_dow  = batch_ci.dow;
 
   // ── Write output CSV header ───────────────────────────────────────────────
-  bool has_lstm = false;  // will be set after first reading
-  // Write header after we know whether LSTM models are present
   bool header_written = false;
 
-  auto WriteHeader = [&](bool with_lstm) {
+  auto WriteHeader = [&]() {
     out << "timestamp,CMMAC"
         << ",dense_cpu_mse,dense_mem_mse"
         << ",dense_cpu_flag,dense_mem_flag"
-        << ",dense_cpu_sev,dense_mem_sev";
-    if (with_lstm) {
-      out << ",lstm_cpu_mse,lstm_mem_mse"
-          << ",lstm_cpu_flag,lstm_mem_flag"
-          << ",lstm_cpu_sev,lstm_mem_sev";
-    }
-    out << ",anomaly_type\n";
+        << ",dense_cpu_sev,dense_mem_sev"
+        << ",anomaly_type\n";
   };
 
   // ── Verbose header ────────────────────────────────────────────────────────
@@ -839,11 +802,10 @@ int Main(int argc, char** argv) {
     gettimeofday(&t1, nullptr);
     const double elapsed_us = get_us(t1) - get_us(t0);
     total_inference_us += elapsed_us;
-    has_lstm = res.has_lstm;
 
     // Write CSV header on first result
     if (!header_written) {
-      WriteHeader(has_lstm);
+      WriteHeader();
       header_written = true;
     }
 
@@ -855,19 +817,13 @@ int Main(int argc, char** argv) {
         << "," << res.dense_cpu_flag
         << "," << res.dense_mem_flag
         << "," << std::setprecision(4) << res.dense_cpu_sev
-        << "," << res.dense_mem_sev;
+        << "," << res.dense_mem_sev
+        << "," << res.anomaly_type << "\n";
 
-    if (has_lstm) {
-      out << "," << std::setprecision(6) << res.lstm_cpu_mse
-          << "," << res.lstm_mem_mse
-          << "," << res.lstm_cpu_flag
-          << "," << res.lstm_mem_flag
-          << "," << std::setprecision(4) << res.lstm_cpu_sev
-          << "," << res.lstm_mem_sev;
-    }
-    out << "," << res.anomaly_type << "\n";
+    // ── Anomaly alert (always printed when anomaly detected) ──────────────
+    PrintAlert(rdg, res);
 
-    // ── Verbose streaming output ──────────────────────────────────────────
+    // ── Verbose streaming table ───────────────────────────────────────────
     if (verbose) {
       std::string alert;
       if (res.anomaly_type != "Normal") {
@@ -889,7 +845,7 @@ int Main(int argc, char** argv) {
     ++row_num;
   }
 
-  if (!header_written) WriteHeader(false);  // empty input edge case
+  if (!header_written) WriteHeader();  // empty input edge case
 
   std::cerr << "\nProcessed " << row_num << " readings.\n";
   // if (row_num > 0) {

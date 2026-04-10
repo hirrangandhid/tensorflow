@@ -52,15 +52,11 @@
         "day_of_week": 0.16666666666666666
       }
     },
-    "anomaly_threshold": 0.0026691509410738945
+    "anomaly_threshold": 0.001619811519049108
   },
   "memory_model": {
     "tflite_file": "memory_anomaly_model.tflite",
     "feature_order": [
-      "USED_MEM_ATOM_kB",
-      "AvailMem_kB",
-      "FreeMem_kB",
-      "SlabMem_kB",
       "memory_util_ratio",
       "slab_pressure",
       "free_mem_ratio",
@@ -69,10 +65,6 @@
     ],
     "scaler": {
       "data_min": {
-        "USED_MEM_ATOM_kB": 450284.0,
-        "AvailMem_kB": 1783968.0,
-        "FreeMem_kB": 1403400.0,
-        "SlabMem_kB": 86984.0,
         "memory_util_ratio": 0.1906,
         "slab_pressure": 0.0457,
         "free_mem_ratio": 0.7835,
@@ -80,10 +72,6 @@
         "day_of_week": 0.0
       },
       "data_max": {
-        "USED_MEM_ATOM_kB": 579924.0,
-        "AvailMem_kB": 1914704.0,
-        "FreeMem_kB": 1547716.0,
-        "SlabMem_kB": 109532.0,
         "memory_util_ratio": 0.2449,
         "slab_pressure": 0.0601,
         "free_mem_ratio": 0.8239,
@@ -91,10 +79,6 @@
         "day_of_week": 6.0
       },
       "scale": {
-        "USED_MEM_ATOM_kB": 7.71366862079605e-06,
-        "AvailMem_kB": 7.649002570064864e-06,
-        "FreeMem_kB": 6.929238615260955e-06,
-        "SlabMem_kB": 4.434983147064041e-05,
         "memory_util_ratio": 18.416206261510123,
         "slab_pressure": 69.44444444444443,
         "free_mem_ratio": 24.752475247524757,
@@ -102,7 +86,7 @@
         "day_of_week": 0.16666666666666666
       }
     },
-    "anomaly_threshold": 6.269131063163513e-06
+    "anomaly_threshold": 4.456790975382319e-06
   },
   "lstm_cpu_model": {
     "tflite_file": "lstm_cpu_anomaly_model.tflite",
@@ -158,15 +142,11 @@
         "day_of_week": 0.16666666666666666
       }
     },
-    "anomaly_threshold": 0.0023531762417405844
+    "anomaly_threshold": 0.002235148102045059
   },
   "lstm_memory_model": {
     "tflite_file": "lstm_memory_anomaly_model.tflite",
     "feature_order": [
-      "USED_MEM_ATOM_kB",
-      "AvailMem_kB",
-      "FreeMem_kB",
-      "SlabMem_kB",
       "memory_util_ratio",
       "slab_pressure",
       "free_mem_ratio",
@@ -177,10 +157,6 @@
     "flex_delegate": true,
     "scaler": {
       "data_min": {
-        "USED_MEM_ATOM_kB": 450284.0,
-        "AvailMem_kB": 1783968.0,
-        "FreeMem_kB": 1403400.0,
-        "SlabMem_kB": 86984.0,
         "memory_util_ratio": 0.1906,
         "slab_pressure": 0.0457,
         "free_mem_ratio": 0.7835,
@@ -188,10 +164,6 @@
         "day_of_week": 0.0
       },
       "data_max": {
-        "USED_MEM_ATOM_kB": 579924.0,
-        "AvailMem_kB": 1914704.0,
-        "FreeMem_kB": 1547716.0,
-        "SlabMem_kB": 109532.0,
         "memory_util_ratio": 0.2449,
         "slab_pressure": 0.0601,
         "free_mem_ratio": 0.8239,
@@ -199,10 +171,6 @@
         "day_of_week": 6.0
       },
       "scale": {
-        "USED_MEM_ATOM_kB": 7.71366862079605e-06,
-        "AvailMem_kB": 7.649002570064864e-06,
-        "FreeMem_kB": 6.929238615260955e-06,
-        "SlabMem_kB": 4.434983147064041e-05,
         "memory_util_ratio": 18.416206261510123,
         "slab_pressure": 69.44444444444443,
         "free_mem_ratio": 24.752475247524757,
@@ -210,6 +178,6 @@
         "day_of_week": 0.16666666666666666
       }
     },
-    "anomaly_threshold": 0.00031382101587951183
+    "anomaly_threshold": 0.0003570046101231128
   }
 }

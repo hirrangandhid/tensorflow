@@ -47,8 +47,6 @@ inference_app.ipynb. Every arithmetic operation matches the Python:
 #include "tensorflow/lite/kernels/register.h"
 #include "tensorflow/lite/optional_debug_tools.h"
 
-#include <dlfcn.h>  // dlopen / dlsym — for loading libtensorflowlite_flex.so at runtime
-
 namespace tflite {
 namespace anomaly_detection {
 
@@ -91,8 +89,6 @@ static ModelConfig ParseModelConfig(const json& j) {
   ModelConfig mc;
   mc.tflite_file       = j["tflite_file"].get<std::string>();
   mc.anomaly_threshold = static_cast<float>(j["anomaly_threshold"].get<double>());
-  mc.seq_len           = j.value("seq_len", 1);
-  mc.flex_delegate     = j.value("flex_delegate", false);
 
   std::vector<std::string> feat_order;
   for (const auto& f : j["feature_order"]) feat_order.push_back(f.get<std::string>());
@@ -112,15 +108,6 @@ InferenceConfig LoadConfig(const std::string& config_path) {
   cfg.rolling_window  = j.value("rolling_window", 10);
   cfg.cpu_model       = ParseModelConfig(j["cpu_model"]);
   cfg.memory_model    = ParseModelConfig(j["memory_model"]);
-
-  if (j.contains("lstm_cpu_model")) {
-    cfg.lstm_cpu_model = ParseModelConfig(j["lstm_cpu_model"]);
-    cfg.has_lstm_cpu   = true;
-  }
-  if (j.contains("lstm_memory_model")) {
-    cfg.lstm_memory_model = ParseModelConfig(j["lstm_memory_model"]);
-    cfg.has_lstm_mem      = true;
-  }
   return cfg;
 }
 
@@ -140,33 +127,11 @@ AnomalyInferenceEngine::AnomalyInferenceEngine(const std::string& config_path,
   delegate_options_ = delegate_options;
   verbose_          = verbose;
 
-  // Dense models are always required
+  // Dense models
   LoadInterpreter(cfg_.cpu_model.tflite_file,    dense_cpu_fb_, dense_cpu_interp_,
-                  false, nullptr, &dense_cpu_ext_delegate_, verbose_);
+                  &dense_cpu_ext_delegate_, verbose_);
   LoadInterpreter(cfg_.memory_model.tflite_file, dense_mem_fb_, dense_mem_interp_,
-                  false, nullptr, &dense_mem_ext_delegate_, verbose_);
-
-  // LSTM models are optional — they use SELECT_TF_OPS (Flex delegate)
-  if (cfg_.has_lstm_cpu) {
-    try {
-      LoadInterpreter(cfg_.lstm_cpu_model.tflite_file, lstm_cpu_fb_, lstm_cpu_interp_,
-                      cfg_.lstm_cpu_model.flex_delegate, &lstm_cpu_delegate_,
-                      &lstm_cpu_ext_delegate_, verbose_);
-    } catch (const std::exception& e) {
-      std::cerr << "Warning: could not load lstm_cpu_model — " << e.what() << "\n";
-      cfg_.has_lstm_cpu = false;
-    }
-  }
-  if (cfg_.has_lstm_mem) {
-    try {
-      LoadInterpreter(cfg_.lstm_memory_model.tflite_file, lstm_mem_fb_, lstm_mem_interp_,
-                      cfg_.lstm_memory_model.flex_delegate, &lstm_mem_delegate_,
-                      &lstm_mem_ext_delegate_, verbose_);
-    } catch (const std::exception& e) {
-      std::cerr << "Warning: could not load lstm_memory_model — " << e.what() << "\n";
-      cfg_.has_lstm_mem = false;
-    }
-  }
+                  &dense_mem_ext_delegate_, verbose_);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -177,8 +142,6 @@ void AnomalyInferenceEngine::LoadInterpreter(
     const std::string& path,
     std::unique_ptr<tflite::FlatBufferModel>& fb_out,
     std::unique_ptr<tflite::Interpreter>& interp_out,
-    bool use_flex_delegate,
-    TfLiteDelegateUniquePtr* delegate_out,
     TfLiteDelegateUniquePtr* ext_delegate_out,
     bool verbose) {
 
@@ -192,11 +155,7 @@ void AnomalyInferenceEngine::LoadInterpreter(
     throw std::runtime_error("Failed to build interpreter for: " + path);
 
   // Apply external hardware delegate if a path was provided.
-  // Skipped for Flex-delegate models (LSTM): those use SELECT_TF_OPS which
-  // the hardware delegate does not support, and presenting an unsupported op
-  // graph to it causes a hard assert in the delegate core rather than a
-  // graceful fallback.
-  if (!delegate_path_.empty() && !use_flex_delegate) {
+  if (!delegate_path_.empty()) {
     TfLiteExternalDelegateOptions opts =
         TfLiteExternalDelegateOptionsDefault(delegate_path_.c_str());
 
@@ -248,41 +207,6 @@ void AnomalyInferenceEngine::LoadInterpreter(
     }
   }
 
-  // Apply the Flex delegate for models that use SELECT_TF_OPS
-  // (e.g. LSTM models — UnidirectionalSequenceLSTM is not a TFLite builtin).
-  // The flex delegate shared library is loaded dynamically at runtime so that
-  // anomaly_app does NOT need to link the full TF runtime at build time.
-  if (use_flex_delegate) {
-    void* flex_lib = dlopen("libtensorflowlite_flex.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!flex_lib)
-      throw std::runtime_error(
-          "dlopen(libtensorflowlite_flex.so) failed: " + std::string(dlerror()) +
-          "\nDeploy libtensorflowlite_flex.so on the target and set LD_LIBRARY_PATH.");
-
-    // TF_AcquireFlexDelegate() is the stable C export from libtensorflowlite_flex.so.
-    // It returns TfLiteDelegateUniquePtr (== std::unique_ptr<TfLiteDelegate, void(*)(TfLiteDelegate*)>).
-    using AcquireFn = TfLiteDelegateUniquePtr (*)();
-    auto* acquire = reinterpret_cast<AcquireFn>(dlsym(flex_lib, "TF_AcquireFlexDelegate"));
-    if (!acquire) {
-      dlclose(flex_lib);
-      throw std::runtime_error(
-          "Symbol TF_AcquireFlexDelegate not found in libtensorflowlite_flex.so");
-    }
-
-    auto flex_delegate = acquire();
-    if (!flex_delegate) {
-      dlclose(flex_lib);
-      throw std::runtime_error("TF_AcquireFlexDelegate() returned null for: " + path);
-    }
-    if (interp_out->ModifyGraphWithDelegate(flex_delegate.get()) != kTfLiteOk) {
-      dlclose(flex_lib);
-      throw std::runtime_error("Failed to apply Flex delegate for: " + path);
-    }
-    if (delegate_out) *delegate_out = std::move(flex_delegate);
-    // Do NOT dlclose(flex_lib) — the delegate's deleter fn lives inside the SO;
-    // the SO must stay loaded for the process lifetime. The OS reclaims it at exit.
-  }
-
   interp_out->SetNumThreads(num_threads_);
 
   if (interp_out->AllocateTensors() != kTfLiteOk)
@@ -326,10 +250,11 @@ std::vector<float> AnomalyInferenceEngine::ApplyMinMaxScaler(
 //    cpu_rolling_mean, cpu_rolling_std, slab_pressure,
 //    total_clients, hour_of_day, day_of_week]
 //
-// Memory feature vector (9 elements):
-//   [USED_MEM_ATOM_kB, AvailMem_kB, FreeMem_kB, SlabMem_kB,
-//    memory_util_ratio, slab_pressure, free_mem_ratio,
+// Memory feature vector (5 elements — hardware-agnostic ratios only):
+//   [memory_util_ratio, slab_pressure, free_mem_ratio,
 //    hour_of_day, day_of_week]
+// Raw kB values excluded: they are hardware-tier-specific and cause false positives
+// when devices with different RAM capacities are mixed in the same fleet.
 // ─────────────────────────────────────────────────────────────────────────────
 
 void AnomalyInferenceEngine::ComputeFeatures(const TelemetryReading& r,
@@ -374,8 +299,10 @@ void AnomalyInferenceEngine::ComputeFeatures(const TelemetryReading& r,
               static_cast<float>(r.hour_of_day),
               static_cast<float>(r.day_of_week)};
 
-  mem_feat = {r.used_mem_kb, r.avail_mem_kb, r.free_mem_kb, r.slab_mem_kb,
-              mem_util_ratio, slab_pressure, free_mem_ratio,
+  // Raw kB values excluded — hardware-agnostic ratios only.
+  // Order matches MEM_FEATURES in model_building.ipynb:
+  //   memory_util_ratio, slab_pressure, free_mem_ratio, hour_of_day, day_of_week
+  mem_feat = {mem_util_ratio, slab_pressure, free_mem_ratio,
               static_cast<float>(r.hour_of_day),
               static_cast<float>(r.day_of_week)};
 }
@@ -409,45 +336,6 @@ float AnomalyInferenceEngine::RunDenseInference(tflite::Interpreter* interp,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// RunLstmInference — mirrors Python run_lstm_inference()
-//   seq shape: (seq_len, n_features)  — zero-padded at front if < seq_len rows
-//   input tensor shape: (1, seq_len, n_features)
-//   return: mean((inp - out)²)  over all seq_len * n_features elements
-// ─────────────────────────────────────────────────────────────────────────────
-
-float AnomalyInferenceEngine::RunLstmInference(
-    tflite::Interpreter* interp,
-    const std::deque<std::vector<float>>& seq,
-    int seq_len, int n_features) {
-
-  const int in_idx  = interp->inputs()[0];
-  const int out_idx = interp->outputs()[0];
-  const int total   = seq_len * n_features;
-
-  float* in_ptr = interp->typed_tensor<float>(in_idx);
-
-  // Zero-fill front padding, then copy real sequences
-  int pad_rows = seq_len - static_cast<int>(seq.size());
-  int offset   = 0;
-  for (int r = 0; r < pad_rows; ++r) {
-    for (int c = 0; c < n_features; ++c) in_ptr[offset++] = 0.0f;
-  }
-  for (const auto& row : seq) {
-    for (int c = 0; c < n_features; ++c) in_ptr[offset++] = row[c];
-  }
-
-  interp->Invoke();
-
-  const float* out_ptr = interp->typed_tensor<float>(out_idx);
-  float mse = 0.0f;
-  for (int i = 0; i < total; ++i) {
-    float diff = in_ptr[i] - out_ptr[i];
-    mse += diff * diff;
-  }
-  return mse / static_cast<float>(total);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // ProcessReading — mirrors Python process_reading()
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -477,41 +365,7 @@ AnomalyResult AnomalyInferenceEngine::ProcessReading(const TelemetryReading& r) 
   result.dense_cpu_sev  = d_cpu_mse / cpu_thr;
   result.dense_mem_sev  = d_mem_mse / mem_thr;
 
-  // 4. LSTM CPU (optional)
-  int cpu_n = static_cast<int>(cfg_.cpu_model.scaler.feature_order.size());
-  if (cfg_.has_lstm_cpu && lstm_cpu_interp_) {
-    state.cpu_seq.push_back(cpu_sc);
-    if (static_cast<int>(state.cpu_seq.size()) > seq_len_)
-      state.cpu_seq.pop_front();
-
-    float l_cpu_mse = RunLstmInference(lstm_cpu_interp_.get(),
-                                       state.cpu_seq, seq_len_, cpu_n);
-    float l_cpu_thr = cfg_.lstm_cpu_model.anomaly_threshold;
-
-    result.lstm_cpu_mse  = l_cpu_mse;
-    result.lstm_cpu_flag = (l_cpu_mse > l_cpu_thr) ? 1 : 0;
-    result.lstm_cpu_sev  = l_cpu_mse / l_cpu_thr;
-    result.has_lstm      = true;
-  }
-
-  // 5. LSTM Memory (optional)
-  int mem_n = static_cast<int>(cfg_.memory_model.scaler.feature_order.size());
-  if (cfg_.has_lstm_mem && lstm_mem_interp_) {
-    state.mem_seq.push_back(mem_sc);
-    if (static_cast<int>(state.mem_seq.size()) > seq_len_)
-      state.mem_seq.pop_front();
-
-    float l_mem_mse = RunLstmInference(lstm_mem_interp_.get(),
-                                       state.mem_seq, seq_len_, mem_n);
-    float l_mem_thr = cfg_.lstm_memory_model.anomaly_threshold;
-
-    result.lstm_mem_mse  = l_mem_mse;
-    result.lstm_mem_flag = (l_mem_mse > l_mem_thr) ? 1 : 0;
-    result.lstm_mem_sev  = l_mem_mse / l_mem_thr;
-    result.has_lstm      = true;
-  }
-
-  // 6. Classify — based on dense flags only (matches Python)
+  // Classify
   int c = result.dense_cpu_flag;
   int m = result.dense_mem_flag;
   if      (c && m) result.anomaly_type = "Both";

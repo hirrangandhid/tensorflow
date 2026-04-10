@@ -19,13 +19,10 @@ C++ inference engine for DOCSIS gateway telemetry anomaly detection.
 
 Mirrors the Python AnomalyInferenceEngine in inference_app.ipynb exactly:
   - Dense AutoEncoder  : stateless, processes each row independently
-  - LSTM  AutoEncoder  : stateful, maintains per-device rolling window
 
-Four TFLite models are supported:
+Two TFLite models are supported:
   cpu_anomaly_model.tflite       Dense AE  input (1, 10)
-  memory_anomaly_model.tflite    Dense AE  input (1,  9)
-  lstm_cpu_anomaly_model.tflite  LSTM  AE  input (1, 10, 10)
-  lstm_memory_anomaly_model.tflite LSTM AE input (1, 10,  9)
+  memory_anomaly_model.tflite    Dense AE  input (1,  5)   [ratio-only features]
 ============================================================================*/
 
 #ifndef TENSORFLOW_LITE_EXAMPLES_ANOMALY_DETECTION_ANOMALY_DETECTION_H_
@@ -63,8 +60,6 @@ struct ScalerParams {
 struct ModelConfig {
   std::string  tflite_file;
   float        anomaly_threshold = 0.0f;
-  int          seq_len           = 1;      // 1 for dense, 10 for LSTM
-  bool         flex_delegate     = false;
   ScalerParams scaler;
 };
 
@@ -73,10 +68,6 @@ struct InferenceConfig {
   int         rolling_window = 10;
   ModelConfig cpu_model;
   ModelConfig memory_model;
-  ModelConfig lstm_cpu_model;
-  ModelConfig lstm_memory_model;
-  bool        has_lstm_cpu = false;
-  bool        has_lstm_mem = false;
 };
 
 // ── One raw telemetry reading ─────────────────────────────────────────────────
@@ -96,32 +87,20 @@ struct TelemetryReading {
   int   day_of_week  = 0;
 };
 
-// ── Inference result (mirrors Python process_reading() return dict) ───────────
+// ── Inference result ─────────────────────────────────────────────────────────
 struct AnomalyResult {
-  // Dense AE
   float dense_cpu_mse  = 0.0f;
   float dense_mem_mse  = 0.0f;
   int   dense_cpu_flag = 0;     // 1 = anomaly
   int   dense_mem_flag = 0;
   float dense_cpu_sev  = 0.0f; // MSE / threshold  (> 1.0 = anomaly)
   float dense_mem_sev  = 0.0f;
-  // LSTM AE (only populated when LSTM models are loaded)
-  float lstm_cpu_mse   = 0.0f;
-  float lstm_mem_mse   = 0.0f;
-  int   lstm_cpu_flag  = 0;
-  int   lstm_mem_flag  = 0;
-  float lstm_cpu_sev   = 0.0f;
-  float lstm_mem_sev   = 0.0f;
-  bool  has_lstm       = false;
-  // Classification
   std::string anomaly_type;    // "Normal" | "CPU" | "Memory" | "Both"
 };
 
 // ── Per-device stateful rolling window ────────────────────────────────────────
 struct DeviceState {
-  std::deque<float>               cpu_history; // raw CPU% values (up to SEQ_LEN)
-  std::deque<std::vector<float>>  cpu_seq;     // scaled CPU feature vectors
-  std::deque<std::vector<float>>  mem_seq;     // scaled Mem feature vectors
+  std::deque<float> cpu_history; // raw CPU% values (up to SEQ_LEN)
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -162,26 +141,15 @@ class AnomalyInferenceEngine {
   std::string     delegate_options_;  // semicolon-separated key:value options
   bool            verbose_ = false;   // if true, PrintInterpreterState after each model load
 
-  // TFLite model data + interpreters (dense and optional LSTM)
+  // TFLite model data + interpreters (Dense AE only)
   std::unique_ptr<tflite::FlatBufferModel> dense_cpu_fb_;
   std::unique_ptr<tflite::FlatBufferModel> dense_mem_fb_;
-  std::unique_ptr<tflite::FlatBufferModel> lstm_cpu_fb_;
-  std::unique_ptr<tflite::FlatBufferModel> lstm_mem_fb_;
 
   std::unique_ptr<tflite::Interpreter> dense_cpu_interp_;
   std::unique_ptr<tflite::Interpreter> dense_mem_interp_;
-  std::unique_ptr<tflite::Interpreter> lstm_cpu_interp_;
-  std::unique_ptr<tflite::Interpreter> lstm_mem_interp_;
-  // Flex delegates for LSTM models — must outlive their interpreters.
-  // Initialized with {nullptr, nullptr} because TfLiteDelegateUniquePtr uses
-  // a raw function pointer deleter which has no default constructor.
-  TfLiteDelegateUniquePtr lstm_cpu_delegate_{nullptr, nullptr};
-  TfLiteDelegateUniquePtr lstm_mem_delegate_{nullptr, nullptr};
   // External (hardware) delegates — one per interpreter, must outlive the interpreter.
   TfLiteDelegateUniquePtr dense_cpu_ext_delegate_{nullptr, nullptr};
   TfLiteDelegateUniquePtr dense_mem_ext_delegate_{nullptr, nullptr};
-  TfLiteDelegateUniquePtr lstm_cpu_ext_delegate_{nullptr, nullptr};
-  TfLiteDelegateUniquePtr lstm_mem_ext_delegate_{nullptr, nullptr};
 
   // Per-device state keyed by MAC string
   std::unordered_map<std::string, DeviceState> device_states_;
@@ -189,18 +157,14 @@ class AnomalyInferenceEngine {
   // ── Helpers ────────────────────────────────────────────────────────────────
   DeviceState& GetState(const std::string& mac);
 
-  // use_flex_delegate=true required for LSTM models (flex_delegate: true in config)
-  // because UnidirectionalSequenceLSTM is a SELECT_TF_OPS op, not a TFLite builtin.
   // ext_delegate_out receives ownership of the external hardware delegate (if any).
   void LoadInterpreter(const std::string& path,
                        std::unique_ptr<tflite::FlatBufferModel>& fb_out,
                        std::unique_ptr<tflite::Interpreter>& interp_out,
-                       bool use_flex_delegate = false,
-                       TfLiteDelegateUniquePtr* delegate_out = nullptr,
                        TfLiteDelegateUniquePtr* ext_delegate_out = nullptr,
                        bool verbose = false);
 
-  // Compute CPU (10-feature) and Memory (9-feature) vectors from raw reading.
+  // Compute CPU (10-feature) and Memory (5-feature, ratio-only) vectors from raw reading.
   // Matches Python _compute_features() exactly, including ddof=1 rolling std.
   void ComputeFeatures(const TelemetryReading& r,
                        DeviceState& state,
@@ -215,12 +179,6 @@ class AnomalyInferenceEngine {
   static float RunDenseInference(tflite::Interpreter* interp,
                                  const std::vector<float>& x_scaled);
 
-  // LSTM AE forward pass → mean reconstruction MSE over all elements.
-  // seq_scaled is shape (seq_len, n_features) — zero-padded at the front.
-  static float RunLstmInference(
-      tflite::Interpreter* interp,
-      const std::deque<std::vector<float>>& seq,
-      int seq_len, int n_features);
 };
 
 // ── Config loader (parses inference_config.json) ──────────────────────────────

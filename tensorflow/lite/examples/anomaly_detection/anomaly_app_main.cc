@@ -299,14 +299,14 @@ static void PrintAlert(const TelemetryReading& rdg, const AnomalyResult& res) {
   std::cerr << "  CPU  : MSE=" << std::fixed << std::setprecision(6) << res.dense_cpu_mse
             << "  sev=" << std::setprecision(2) << res.dense_cpu_sev << "x";
   if (cpu_flag)
-    std::cerr << "  <-- ANOMALY (" << std::setprecision(1) << res.dense_cpu_sev << "x worse than normal)";
+    std::cerr << "  <-- ANOMALY";
   std::cerr << "\n";
 
   // Memory sub-system line
   std::cerr << "  Mem  : MSE=" << std::fixed << std::setprecision(6) << res.dense_mem_mse
             << "  sev=" << std::setprecision(2) << res.dense_mem_sev << "x";
   if (mem_flag)
-    std::cerr << "  <-- ANOMALY (" << std::setprecision(1) << res.dense_mem_sev << "x worse than normal)";
+    std::cerr << "  <-- ANOMALY";
   std::cerr << "\n";
 
   std::cerr << "\n";
@@ -332,10 +332,16 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
 
   // ── Open result file in append mode ──────────────────────────────────────
   // Do NOT write a header if the file already has content (daemon may restart).
+  // Track the inode so we can detect if the file is deleted/replaced by the
+  // log uploader while the daemon is running (ghost-fd problem).
   bool result_has_data = false;
+  ino_t result_inode = 0;
   {
     struct stat st;
-    result_has_data = (stat(result_path.c_str(), &st) == 0 && st.st_size > 0);
+    if (stat(result_path.c_str(), &st) == 0) {
+      result_has_data = (st.st_size > 0);
+      result_inode    = st.st_ino;
+    }
   }
   std::ofstream fout(result_path, std::ios::app);
   if (!fout) {
@@ -343,6 +349,44 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
     return EXIT_FAILURE;
   }
   bool header_written = result_has_data;
+
+  // ── Helper: reopen result file if it was deleted or replaced ───────────────
+  // The log uploader may delete anomaly_results.csv after each upload cycle.
+  // Without this check, fout keeps writing to the now-unlinked inode and the
+  // new on-disk file stays empty.
+  auto EnsureResultFile = [&]() -> bool {
+    struct stat st;
+    bool need_reopen = !fout.is_open() || !fout.good();
+    if (!need_reopen) {
+      if (stat(result_path.c_str(), &st) != 0) {
+        need_reopen = true;   // file was deleted
+      } else if (st.st_ino != result_inode) {
+        need_reopen = true;   // file was replaced
+      }
+    }
+    if (need_reopen) {
+      fout.close();
+      fout.clear();
+      // Wait briefly for the uploader to finish creating the new file
+      for (int retry = 0; retry < 10 && !g_stop; ++retry) {
+        fout.open(result_path, std::ios::app);
+        if (fout.is_open()) break;
+        usleep(200000);  // 200 ms
+      }
+      if (!fout.is_open()) {
+        std::cerr << "[daemon] Cannot reopen result file: " << result_path << "\n";
+        return false;
+      }
+      if (stat(result_path.c_str(), &st) == 0) {
+        result_inode  = st.st_ino;
+        header_written = (st.st_size > 0);
+      } else {
+        header_written = false;
+      }
+      std::cerr << "[daemon] Result file reopened (log rotation): " << result_path << "\n";
+    }
+    return true;
+  };
 
   // ── File tracking ─────────────────────────────────────────────────────────
   ColIdx ci;
@@ -400,6 +444,9 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
   // ── Helper: read from last_pos to EOF, run inference, write results ───────
   int total_rows = 0;
   auto DrainFile = [&]() {
+    // ── Detect result-file rotation before writing any rows ──────────────
+    EnsureResultFile();
+
     fin.seekg(last_pos);
     fin.clear();
     std::string line;
@@ -521,6 +568,11 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
         }
         if (g_stop) break;
         if (!OpenWatchFile()) continue;
+        // Drain any residual inotify events (IN_CREATE etc.) that accumulated
+        // while we were waiting. Without this, a stale IN_CREATE would trigger
+        // a second reopen on the next loop iteration, resetting last_pos to 0
+        // and reprocessing already-handled rows.
+        { ssize_t n_ev; while ((n_ev = read(ifd, ev_buf, sizeof(ev_buf))) > 0) {} }
         std::cerr << "[daemon] Watching (new file): " << watch_path << "\n";
       }
     } else
@@ -550,6 +602,13 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
       std::cerr << "[daemon] File rotated. Re-opening: " << watch_path << "\n";
       if (!OpenWatchFile()) continue;
     }
+
+    // Ensure the result file is still writable on every loop tick — not just
+    // when DrainFile() is about to run.  Without this, if anomaly_results.csv
+    // is deleted between two system_stats rows (a common log-rotation window),
+    // the empty replacement file is never written to until the next data row
+    // arrives, which can be minutes later.
+    EnsureResultFile();
 
     if (cur_size == last_pos) continue;  // no new data yet
 

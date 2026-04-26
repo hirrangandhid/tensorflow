@@ -17,13 +17,21 @@ anomaly_detection.cc
 ────────────────────────────────────────────────────────────────────────────
 C++ inference engine for DOCSIS gateway telemetry anomaly detection.
 
-Single-point autoencoder models for CPU anomaly detection.
-Designed for idle devices (0 clients) with client-independent features.
+Delta-enhanced autoencoder models for CPU and memory anomaly detection.
+Designed for edge deployment with minimal state storage (16 bytes for memory deltas).
 
 Feature computation for CPU model (11 features):
   USED_CPU_ATOM, LOAD_AVG_ATOM, slab_ratio, load_cpu_ratio,
   hour_sin, hour_cos, dow_sin, dow_cos,
   cpu_delta, load_delta, cpu_delta_abs
+
+Feature computation for Memory model (19 features):
+  Single-point (13): mem_utilization, avail_to_total, free_to_avail, slab_pressure,
+                     mem_fragmentation, cache_ratio, slab_to_free,
+                     cpu_normalized, load_normalized, clients_normalized, mem_per_client,
+                     hour_sin, hour_cos
+  Delta (6): mem_utilization_delta, avail_to_total_delta, slab_pressure_delta,
+             free_to_avail_delta, mem_util_delta_abs, slab_delta_abs
 
 MinMaxScaler: clip((x - min) / range, 0.0, 1.0)
 MSE: mean((input − reconstructed)²) over all elements
@@ -282,14 +290,14 @@ void AnomalyInferenceEngine::ComputeCpuFeatures(const TelemetryReading& r,
   float dow_cos  = std::cos(2.0f * PI * dow / 7.0f);
 
   // Delta features (difference from previous reading)
-  float cpu_delta  = state.initialized ? (r.used_cpu - state.prev_cpu) : 0.0f;
-  float load_delta = state.initialized ? (r.load_avg - state.prev_load) : 0.0f;
+  float cpu_delta  = state.cpu_initialized ? (r.used_cpu - state.prev_cpu) : 0.0f;
+  float load_delta = state.cpu_initialized ? (r.load_avg - state.prev_load) : 0.0f;
   float cpu_delta_abs = std::fabs(cpu_delta);
 
   // Update state for next reading
   state.prev_cpu = r.used_cpu;
   state.prev_load = r.load_avg;
-  state.initialized = true;
+  state.cpu_initialized = true;
 
   // Assemble feature vector (11 features)
   cpu_feat = {
@@ -308,23 +316,133 @@ void AnomalyInferenceEngine::ComputeCpuFeatures(const TelemetryReading& r,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ComputeMemFeatures — memory model (5 features, ratio-only)
-// ─────────────────────────────────────────────────────────────────────────────
+// ComputeMemFeatures — delta-enhanced memory model (19 features)
+//
+// Single-point features (13):
+//   mem_utilization, avail_to_total, free_to_avail, slab_pressure,
+//   mem_fragmentation, cache_ratio, slab_to_free,
+//   cpu_normalized, load_normalized, clients_normalized, mem_per_client,
+//   hour_sin, hour_cos
+//
+// Delta features (6):
+//   mem_utilization_delta, avail_to_total_delta, slab_pressure_delta,
+//   free_to_avail_delta, mem_util_delta_abs, slab_delta_abs
+// ───────────────────────────────────────────────────────────────────────────────
 
 void AnomalyInferenceEngine::ComputeMemFeatures(const TelemetryReading& r,
+                                                DeviceState& state,
                                                 std::vector<float>& mem_feat) const {
-  const float eps = 1e-9f;
+  const float eps = 1e-6f;
+  const float PI = 3.14159265358979323846f;
 
-  float mem_util_ratio = r.used_mem_kb / (r.used_mem_kb + r.avail_mem_kb + eps);
-  float slab_pressure  = r.slab_mem_kb / (r.avail_mem_kb + eps);
-  float free_mem_ratio = r.free_mem_kb / (r.avail_mem_kb + eps);
+  // ===========================================================================
+  // CORE MEMORY RATIO FEATURES (device-agnostic)
+  // ===========================================================================
+  
+  // Total memory estimate (used + available)
+  float total_mem = r.used_mem_kb + r.avail_mem_kb;
+  
+  // Memory utilization ratio (primary indicator)
+  float mem_utilization = r.used_mem_kb / (total_mem + eps);
+  
+  // Available memory ratio (inverse of pressure)
+  float avail_to_total = r.avail_mem_kb / (total_mem + eps);
+  
+  // Free to available ratio (fragmentation indicator)
+  float free_to_avail = r.free_mem_kb / (r.avail_mem_kb + eps);
+  
+  // Slab pressure ratio (kernel memory pressure)
+  float slab_pressure = r.slab_mem_kb / (total_mem + eps);
 
+  // ===========================================================================
+  // DERIVED MEMORY INDICATORS
+  // ===========================================================================
+  
+  // Memory fragmentation: low free/avail ratio with high used memory
+  float mem_fragmentation = (1.0f - free_to_avail) * mem_utilization;
+  
+  // Cache efficiency: difference between available and free (cached/buffer)
+  float cache_ratio = (r.avail_mem_kb - r.free_mem_kb) / (total_mem + eps);
+  
+  // Slab to free ratio (kernel pressure relative to free memory)
+  float slab_to_free = r.slab_mem_kb / (r.free_mem_kb + eps);
+
+  // ===========================================================================
+  // CONTEXTUAL FEATURES (workload context)
+  // ===========================================================================
+  
+  // CPU and load context (normalized)
+  float cpu_normalized = r.used_cpu / 100.0f;
+  float load_normalized = r.load_avg / 4.0f;  // Assuming max load ~4
+  
+  // Total client count (network load indicator)
+  int total_clients = r.clients_2g + r.clients_5g + r.clients_6g;
+  float clients_normalized = static_cast<float>(total_clients) / 20.0f;
+  
+  // Memory per client (memory pressure per workload unit)
+  float mem_per_client = mem_utilization / (static_cast<float>(total_clients) + 1.0f);
+
+  // ===========================================================================
+  // TEMPORAL FEATURES (cyclical encoding)
+  // ===========================================================================
+  
+  float hour = static_cast<float>(r.hour_of_day);
+  float hour_sin = std::sin(2.0f * PI * hour / 24.0f);
+  float hour_cos = std::cos(2.0f * PI * hour / 24.0f);
+
+  // ===========================================================================
+  // DELTA FEATURES (trend detection)
+  // ===========================================================================
+  
+  float mem_util_delta = 0.0f;
+  float avail_delta = 0.0f;
+  float slab_delta = 0.0f;
+  float free_avail_delta = 0.0f;
+  
+  if (state.mem_initialized) {
+    mem_util_delta = mem_utilization - state.prev_mem_utilization;
+    avail_delta = avail_to_total - state.prev_avail_to_total;
+    slab_delta = slab_pressure - state.prev_slab_pressure;
+    free_avail_delta = free_to_avail - state.prev_free_to_avail;
+  }
+  
+  // Update state for next reading
+  state.prev_mem_utilization = mem_utilization;
+  state.prev_avail_to_total = avail_to_total;
+  state.prev_slab_pressure = slab_pressure;
+  state.prev_free_to_avail = free_to_avail;
+  state.mem_initialized = true;
+  
+  // Absolute deltas for spike detection
+  float mem_util_delta_abs = std::fabs(mem_util_delta);
+  float slab_delta_abs = std::fabs(slab_delta);
+
+  // ===========================================================================
+  // ASSEMBLE FEATURE VECTOR (19 features, order must match training)
+  // ===========================================================================
+  
   mem_feat = {
-    mem_util_ratio,
-    slab_pressure,
-    free_mem_ratio,
-    static_cast<float>(r.hour_of_day),
-    static_cast<float>(r.day_of_week)
+    // Single-point features (13)
+    mem_utilization,      // 0: mem_utilization
+    avail_to_total,       // 1: avail_to_total
+    free_to_avail,        // 2: free_to_avail
+    slab_pressure,        // 3: slab_pressure
+    mem_fragmentation,    // 4: mem_fragmentation
+    cache_ratio,          // 5: cache_ratio
+    slab_to_free,         // 6: slab_to_free
+    cpu_normalized,       // 7: cpu_normalized
+    load_normalized,      // 8: load_normalized
+    clients_normalized,   // 9: clients_normalized
+    mem_per_client,       // 10: mem_per_client
+    hour_sin,             // 11: hour_sin
+    hour_cos,             // 12: hour_cos
+    // Delta features (6)
+    mem_util_delta,       // 13: mem_utilization_delta
+    avail_delta,          // 14: avail_to_total_delta
+    slab_delta,           // 15: slab_pressure_delta
+    free_avail_delta,     // 16: free_to_avail_delta
+    mem_util_delta_abs,   // 17: mem_util_delta_abs
+    slab_delta_abs        // 18: slab_delta_abs
   };
 }
 
@@ -378,7 +496,7 @@ AnomalyResult AnomalyInferenceEngine::ProcessReading(const TelemetryReading& r) 
   // 2. Compute Memory features and run inference (if memory model loaded)
   if (cfg_.has_memory_model) {
     std::vector<float> mem_feat;
-    ComputeMemFeatures(r, mem_feat);
+    ComputeMemFeatures(r, state, mem_feat);
     std::vector<float> mem_sc = ApplyMinMaxScaler(mem_feat, cfg_.memory_model.scaler);
     float mem_mse = RunInference(mem_interp_.get(), mem_sc);
 

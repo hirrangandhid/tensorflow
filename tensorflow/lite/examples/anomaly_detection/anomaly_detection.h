@@ -17,14 +17,14 @@ anomaly_detection.h
 ────────────────────────────────────────────────────────────────────────────
 C++ inference engine for DOCSIS gateway telemetry anomaly detection.
 
-Single-point autoencoder models for CPU and memory anomaly detection.
-Designed for idle devices (0 clients) with client-independent features.
+Delta-enhanced autoencoder models for CPU and memory anomaly detection.
+Designed for edge deployment with minimal state (16 bytes for memory deltas).
 
 Models supported:
-  idle_device_model.tflite       CPU AE   input (1, 11)  [idle device features]
-  memory_anomaly_model.tflite    Mem AE   input (1,  5)  [ratio-only features]
+  cpu_anomaly_model.tflite          CPU AE   input (1, 11)  [cpu device features]
+  memory_anomaly_dynamic.tflite     Mem AE   input (1, 19)  [delta-enhanced features]
 
-Config format (idle_device_config.json):
+Config format (anomaly_config.json):
   - model_file: path to .tflite
   - threshold: anomaly threshold
   - features: ordered list of feature names
@@ -108,9 +108,17 @@ struct AnomalyResult {
 
 // ── Per-device stateful data for delta computation ───────────────────────────
 struct DeviceState {
+  // CPU delta state
   float prev_cpu  = -1.0f;    // previous CPU value (-1 = not set)
   float prev_load = -1.0f;    // previous Load value (-1 = not set)
-  bool  initialized = false;  // true after first reading
+  bool  cpu_initialized = false;  // true after first CPU reading
+  
+  // Memory delta state (for delta-enhanced model)
+  float prev_mem_utilization = -1.0f;
+  float prev_avail_to_total  = -1.0f;
+  float prev_slab_pressure   = -1.0f;
+  float prev_free_to_avail   = -1.0f;
+  bool  mem_initialized = false;  // true after first memory reading
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -181,10 +189,15 @@ class AnomalyInferenceEngine {
                           DeviceState& state,
                           std::vector<float>& cpu_feat) const;
 
-  // Compute Memory features (5 features) - ratio-only
-  // Features: memory_util_ratio, slab_pressure, free_mem_ratio,
-  //           hour_of_day, day_of_week
+  // Compute Memory features (19 features) - delta-enhanced model
+  // Single-point (13): mem_utilization, avail_to_total, free_to_avail, slab_pressure,
+  //                    mem_fragmentation, cache_ratio, slab_to_free,
+  //                    cpu_normalized, load_normalized, clients_normalized, mem_per_client,
+  //                    hour_sin, hour_cos
+  // Delta (6): mem_utilization_delta, avail_to_total_delta, slab_pressure_delta,
+  //            free_to_avail_delta, mem_util_delta_abs, slab_delta_abs
   void ComputeMemFeatures(const TelemetryReading& r,
+                          DeviceState& state,
                           std::vector<float>& mem_feat) const;
 
   // Apply MinMaxScaler: scaled = clip((x - min) / range, 0, 1)

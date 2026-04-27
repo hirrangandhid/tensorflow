@@ -1,6 +1,7 @@
 {
   "model_file": "cpu_anomaly_model.tflite",
   "threshold": 0.11102864891290665,
+  "warmup_samples": 3,
   "features": [
     "USED_CPU_ATOM",
     "LOAD_AVG_ATOM",

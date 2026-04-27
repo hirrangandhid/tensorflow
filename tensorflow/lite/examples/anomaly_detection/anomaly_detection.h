@@ -66,7 +66,9 @@ struct ScalerParams {
 // ── Per-model configuration ───────────────────────────────────────────────────
 struct ModelConfig {
   std::string  model_file;                   // .tflite file path
-  float        threshold = 0.0f;             // anomaly threshold
+  float        threshold = 0.0f;             // anomaly threshold (global)
+  float        device_threshold = 0.0f;      // device-specific threshold (if available)
+  int          warmup_samples = 3;           // skip anomaly flagging for first N samples
   ScalerParams scaler;
 };
 
@@ -112,6 +114,7 @@ struct DeviceState {
   float prev_cpu  = -1.0f;    // previous CPU value (-1 = not set)
   float prev_load = -1.0f;    // previous Load value (-1 = not set)
   bool  cpu_initialized = false;  // true after first CPU reading
+  int   cpu_sample_count = 0;     // samples processed (for warmup)
   
   // Memory delta state (for delta-enhanced model)
   float prev_mem_utilization = -1.0f;
@@ -119,6 +122,7 @@ struct DeviceState {
   float prev_slab_pressure   = -1.0f;
   float prev_free_to_avail   = -1.0f;
   bool  mem_initialized = false;  // true after first memory reading
+  int   mem_sample_count = 0;     // samples processed (for warmup)
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

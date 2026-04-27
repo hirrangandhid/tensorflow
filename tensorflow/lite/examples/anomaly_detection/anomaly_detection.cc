@@ -82,6 +82,16 @@ ModelConfig LoadModelConfig(const std::string& config_path) {
   ModelConfig mc;
   mc.model_file = j.value("model_file", "");
   mc.threshold  = static_cast<float>(j.value("threshold", 0.0));
+  
+  // Use device_specific_threshold if available, otherwise fall back to threshold
+  if (j.contains("device_specific_threshold")) {
+    mc.device_threshold = static_cast<float>(j["device_specific_threshold"].get<double>());
+  } else {
+    mc.device_threshold = mc.threshold;
+  }
+  
+  // Warmup samples (skip anomaly flagging for cold-start)
+  mc.warmup_samples = j.value("warmup_samples", 3);
 
   // Parse features list
   if (j.contains("features")) {
@@ -487,10 +497,14 @@ AnomalyResult AnomalyInferenceEngine::ProcessReading(const TelemetryReading& r) 
   ComputeCpuFeatures(r, state, cpu_feat);
   std::vector<float> cpu_sc = ApplyMinMaxScaler(cpu_feat, cfg_.cpu_model.scaler);
   float cpu_mse = RunInference(cpu_interp_.get(), cpu_sc);
-
-  float cpu_thr = cfg_.cpu_model.threshold;
+  
+  // Increment CPU sample counter and use device threshold
+  state.cpu_sample_count++;
+  float cpu_thr = cfg_.cpu_model.device_threshold;
   result.dense_cpu_mse  = cpu_mse;
-  result.dense_cpu_flag = (cpu_mse > cpu_thr) ? 1 : 0;
+  // Skip flagging during warmup period (cold-start false positive prevention)
+  bool cpu_in_warmup = (state.cpu_sample_count <= cfg_.cpu_model.warmup_samples);
+  result.dense_cpu_flag = (!cpu_in_warmup && cpu_mse > cpu_thr) ? 1 : 0;
   result.dense_cpu_sev  = cpu_mse / cpu_thr;
 
   // 2. Compute Memory features and run inference (if memory model loaded)
@@ -499,10 +513,14 @@ AnomalyResult AnomalyInferenceEngine::ProcessReading(const TelemetryReading& r) 
     ComputeMemFeatures(r, state, mem_feat);
     std::vector<float> mem_sc = ApplyMinMaxScaler(mem_feat, cfg_.memory_model.scaler);
     float mem_mse = RunInference(mem_interp_.get(), mem_sc);
-
-    float mem_thr = cfg_.memory_model.threshold;
+    
+    // Increment memory sample counter and use device threshold
+    state.mem_sample_count++;
+    float mem_thr = cfg_.memory_model.device_threshold;
     result.dense_mem_mse  = mem_mse;
-    result.dense_mem_flag = (mem_mse > mem_thr) ? 1 : 0;
+    // Skip flagging during warmup period (cold-start false positive prevention)
+    bool mem_in_warmup = (state.mem_sample_count <= cfg_.memory_model.warmup_samples);
+    result.dense_mem_flag = (!mem_in_warmup && mem_mse > mem_thr) ? 1 : 0;
     result.dense_mem_sev  = mem_mse / mem_thr;
   }
 

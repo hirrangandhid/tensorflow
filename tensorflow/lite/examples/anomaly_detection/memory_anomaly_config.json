@@ -1,6 +1,7 @@
 {
-  "model_file": "memory_anomaly_dynamic.tflite",
+  "model_file": "memory_anomaly_model.tflite",
   "threshold": 0.03728853048930376,
+  "warmup_samples": 3,
   "features": [
     "mem_utilization",
     "avail_to_total",

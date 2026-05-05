@@ -97,8 +97,53 @@ target_link_libraries(anomaly_app
   anomaly_detection_lib
 )
 
+# ── rbus optional dependency ───────────────────────────────────────────────────
+# Enable rbus IPC (anomaly_app → remediation_agent) when librbus is present.
+# On host/CI builds without rbus all rbus calls are no-ops (safe fallback).
+find_library(RBUS_LIB rbus)
+if(RBUS_LIB)
+  message(STATUS "rbus found: ${RBUS_LIB} — enabling HAVE_RBUS")
+  target_compile_definitions(anomaly_app PRIVATE HAVE_RBUS)
+  target_link_libraries(anomaly_app ${RBUS_LIB})
+else()
+  message(STATUS "rbus not found — anomaly_app will build without rbus support")
+endif()
+
+# ── remediation_agent executable ──────────────────────────────────────────────
+# Bridges rbus events from on-device apps to the MCP server via MQTT.
+find_library(MOSQUITTO_LIB mosquitto)
+find_library(CURL_LIB curl)
+
+if(MOSQUITTO_LIB AND CURL_LIB)
+  add_executable(remediation_agent
+    remediation_agent.cc
+  )
+
+  target_include_directories(remediation_agent PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+  )
+
+  target_link_libraries(remediation_agent
+    ${MOSQUITTO_LIB}
+    ${CURL_LIB}
+    nlohmann_json
+  )
+
+  if(RBUS_LIB)
+    target_compile_definitions(remediation_agent PRIVATE HAVE_RBUS)
+    target_link_libraries(remediation_agent ${RBUS_LIB})
+  endif()
+
+  message(STATUS "remediation_agent target added")
+else()
+  message(STATUS "libmosquitto or libcurl not found — remediation_agent skipped")
+endif()
+
 # ── Optional: Release optimisation flags ─────────────────────────────────────
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
   target_compile_options(anomaly_detection_lib PRIVATE -O3 -DNDEBUG)
   target_compile_options(anomaly_app           PRIVATE -O3 -DNDEBUG)
+  if(TARGET remediation_agent)
+    target_compile_options(remediation_agent   PRIVATE -O3 -DNDEBUG)
+  endif()
 endif()

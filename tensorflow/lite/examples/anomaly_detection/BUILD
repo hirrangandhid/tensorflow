@@ -28,28 +28,11 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
-# ── mcp_rbus IPC framework (header-only) ─────────────────────────────────────
-# mcp_rbus_framework.h must be a declared Bazel target so Bazel symlinks it
-# into the exec root for every action that depends on it.  Without this rule
-# the header is absent from the exec root and the compiler cannot find it,
-# which cascades into thousands of undefined-symbol errors.
-cc_library(
-    name = "mcp_rbus_framework",
-    hdrs = ["mcp_rbus_framework.h"],
-    deps = [":nlohmann_json"],
-    # -finput-charset=UTF-8: source files use Unicode box-drawing characters.
-    # -DHAVE_RBUS: rbus IPC is always enabled on RDK devices.
-    copts = ["-finput-charset=UTF-8", "-DHAVE_RBUS"],
-    linkopts = ["-lrbus"],
-    visibility = ["//visibility:public"],
-)
-
 # ── Inference engine library ──────────────────────────────────────────────────
 cc_library(
     name = "anomaly_detection_lib",
     srcs = ["anomaly_detection.cc"],
     hdrs = ["anomaly_detection.h"],
-    copts = ["-finput-charset=UTF-8"],
     deps = [
         ":nlohmann_json",
         "//tensorflow/lite:framework",
@@ -67,34 +50,7 @@ cc_library(
 cc_binary(
     name = "anomaly_app",
     srcs = ["anomaly_app_main.cc"],
-    copts = ["-finput-charset=UTF-8", "-DHAVE_RBUS"],
     deps = [
         ":anomaly_detection_lib",
-        ":mcp_rbus_framework",
-    ],
-)
-
-# ── remediation_agent ─────────────────────────────────────────────────────────
-# Standalone MQTT-to-rbus bridge.  Subscribes to anomaly alerts from any
-# on-device app via rbus and forwards them to the MQTT broker; receives
-# corrective actions back and executes them via WebPA / TR-181.
-#
-# Runtime deps (provided by the Yocto sysroot / recipe DEPENDS):
-#   libmosquitto  — Eclipse Mosquitto MQTT client
-#   libcurl       — WebPA HTTP calls
-#   librbus       — RDK bus (always enabled)
-#
-# Build:
-#   bazel build //tensorflow/lite/examples/anomaly_detection:remediation_agent
-cc_binary(
-    name = "remediation_agent",
-    srcs = ["remediation_agent.cc"],
-    copts = ["-finput-charset=UTF-8", "-DHAVE_RBUS"],
-    linkopts = [
-        "-lmosquitto",
-        "-lcurl",
-    ],
-    deps = [
-        ":mcp_rbus_framework",
     ],
 )

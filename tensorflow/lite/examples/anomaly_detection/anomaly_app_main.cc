@@ -103,30 +103,11 @@ Output CSV columns:
 #include <sys/inotify.h>    // inotify_init1, inotify_add_watch
 #endif
 
-// rbus IPC framework — enables push-based alert delivery to remediation_agent.
-// Compiled only when -DHAVE_RBUS is set; otherwise all calls are no-ops.
-#include "mcp_rbus_framework.h"
-
 namespace tflite {
 namespace anomaly_detection {
 
 static double get_us(struct timeval t) {
   return static_cast<double>(t.tv_sec) * 1e6 + t.tv_usec;
-}
-
-// ── Log helper ────────────────────────────────────────────────────────────────
-// Writes a timestamped line to /rdklogs/logs/anomaly_app.txt and mirrors to
-// stderr.  Format:  YYYY-MM-DD HH:MM:SS [ad]: <message>
-static void ad_log(const std::string& msg) {
-  time_t now = time(nullptr);
-  struct tm tm_info;
-  localtime_r(&now, &tm_info);
-  char ts[32];
-  strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_info);
-  std::string line = std::string(ts) + " [ad]: " + msg;
-  FILE* f = fopen("/rdklogs/logs/anomaly_app.txt", "a");
-  if (f) { fprintf(f, "%s\n", line.c_str()); fclose(f); }
-  fprintf(stderr, "%s\n", line.c_str());
 }
 
 // ── Minimal CSV parser ────────────────────────────────────────────────────────
@@ -310,21 +291,25 @@ static void PrintAlert(const TelemetryReading& rdg, const AnomalyResult& res) {
   const bool cpu_flag = (res.dense_cpu_flag != 0);
   const bool mem_flag = (res.dense_mem_flag != 0);
 
-  std::ostringstream oss;
+  std::cerr << "\n[ANOMALY] " << rdg.timestamp
+            << "  " << rdg.mac
+            << "  Type=" << res.anomaly_type << "\n";
 
-  oss << "[ANOMALY] " << rdg.timestamp << "  " << rdg.mac
-      << "  Type=" << res.anomaly_type;
-  ad_log(oss.str()); oss.str(""); oss.clear();
+  // CPU sub-system line
+  std::cerr << "  CPU  : MSE=" << std::fixed << std::setprecision(6) << res.dense_cpu_mse
+            << "  sev=" << std::setprecision(2) << res.dense_cpu_sev << "x";
+  if (cpu_flag)
+    std::cerr << "  <-- ANOMALY";
+  std::cerr << "\n";
 
-  oss << "  CPU  : MSE=" << std::fixed << std::setprecision(6) << res.dense_cpu_mse
-      << "  sev=" << std::setprecision(2) << res.dense_cpu_sev << "x";
-  if (cpu_flag) oss << "  <-- ANOMALY";
-  ad_log(oss.str()); oss.str(""); oss.clear();
+  // Memory sub-system line
+  std::cerr << "  Mem  : MSE=" << std::fixed << std::setprecision(6) << res.dense_mem_mse
+            << "  sev=" << std::setprecision(2) << res.dense_mem_sev << "x";
+  if (mem_flag)
+    std::cerr << "  <-- ANOMALY";
+  std::cerr << "\n";
 
-  oss << "  Mem  : MSE=" << std::fixed << std::setprecision(6) << res.dense_mem_mse
-      << "  sev=" << std::setprecision(2) << res.dense_mem_sev << "x";
-  if (mem_flag) oss << "  <-- ANOMALY";
-  ad_log(oss.str());
+  std::cerr << "\n";
 }
 
 // ── File-watcher loop ────────────────────────────────────────────────────────
@@ -345,12 +330,6 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
   signal(SIGTERM, OnSignal);
   signal(SIGINT,  OnSignal);
 
-  // ── rbus integration ─────────────────────────────────────────────────────
-  // Initialise once; if rbus is unavailable the App object becomes a no-op.
-  // The rest of the daemon (CSV output, stderr alerts) is unaffected.
-  mcp_rbus::App rbus_app("anomaly_detection");
-  rbus_app.init();  // non-fatal if rbus not present
-
   // ── Open result file in append mode ──────────────────────────────────────
   // Do NOT write a header if the file already has content (daemon may restart).
   // Track the inode so we can detect if the file is deleted/replaced by the
@@ -366,7 +345,7 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
   }
   std::ofstream fout(result_path, std::ios::app);
   if (!fout) {
-    ad_log("[daemon] Cannot open result file: " + result_path);
+    std::cerr << "[daemon] Cannot open result file: " << result_path << "\n";
     return EXIT_FAILURE;
   }
   bool header_written = result_has_data;
@@ -395,7 +374,7 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
         usleep(200000);  // 200 ms
       }
       if (!fout.is_open()) {
-        ad_log("[daemon] Cannot reopen result file: " + result_path);
+        std::cerr << "[daemon] Cannot reopen result file: " << result_path << "\n";
         return false;
       }
       if (stat(result_path.c_str(), &st) == 0) {
@@ -404,7 +383,7 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
       } else {
         header_written = false;
       }
-      ad_log("[daemon] Result file reopened (log rotation): " + result_path);
+      std::cerr << "[daemon] Result file reopened (log rotation): " << result_path << "\n";
     }
     return true;
   };
@@ -434,7 +413,8 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
       if (!std::getline(fin, hdr)) return false;
       cols = SplitCsv(hdr);
       if (!ci.Parse(cols)) {
-        ad_log("[daemon] Required columns (timestamp, CMMAC) missing in: " + watch_path);
+        std::cerr << "[daemon] Required columns (timestamp, CMMAC) missing in: "
+                  << watch_path << "\n";
         fin.close();
         return false;
       }
@@ -448,17 +428,17 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
   };
 
   // Wait until the file appears (the collector may not have started yet)
-  ad_log("[daemon] Waiting for: " + watch_path);
+  std::cerr << "[daemon] Waiting for: " << watch_path << "\n";
   while (!g_stop && !OpenWatchFile())
     usleep(static_cast<useconds_t>(poll_ms) * 1000u);
   if (g_stop) return EXIT_SUCCESS;
-  ad_log("[daemon] Watching:  " + watch_path);
+  std::cerr << "[daemon] Watching:  " << watch_path << "\n";
 
   // Optionally skip rows already present at startup
   if (skip_existing) {
     fin.seekg(0, std::ios::end);
     last_pos = fin.tellg();
-    ad_log("[daemon] Skipping existing rows (--skip-existing).");
+    std::cerr << "[daemon] Skipping existing rows (--skip-existing).\n";
   }
 
   // ── Helper: read from last_pos to EOF, run inference, write results ───────
@@ -485,40 +465,12 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
       WriteResultRow(fout, rdg, res);
       fout.flush();
       PrintAlert(rdg, res);
-
-      // ── Publish anomaly alert via rbus ─────────────────────────────────
-      // Skips Normal readings; skips silently if rbus was not initialised.
-      if (res.anomaly_type != "Normal") {
-        nlohmann::json rbus_payload = {
-          {"cpu_mse",  res.dense_cpu_mse},
-          {"mem_mse",  res.dense_mem_mse},
-          {"cpu_flag", res.dense_cpu_flag != 0},
-          {"mem_flag", res.dense_mem_flag != 0},
-        };
-        // Store the serialised string in a named variable so the pointer passed
-        // to Alert::build() is not a dangling reference to a temporary.
-        // GCC 12+ (used in some Yocto toolchains) flags .dump().c_str() with
-        // -Wdangling-pointer, which becomes a hard error via -Werror.
-        std::string rbus_payload_str = rbus_payload.dump();
-        mcp_rbus::Alert rbus_alert = mcp_rbus::Alert::build(
-          "anomaly_detection",
-          rdg.mac.c_str(),
-          rdg.timestamp.c_str(),
-          res.anomaly_type.c_str(),
-          static_cast<int>(res.dense_cpu_sev),
-          static_cast<int>(res.dense_mem_sev),
-          rbus_payload_str.c_str()
-        );
-        rbus_app.publish(rbus_alert);
-      }
-
       if (verbose && res.anomaly_type != "Normal") {
-        std::ostringstream _oss;
-        _oss << "[daemon] ALERT " << rdg.mac << " ts=" << rdg.timestamp
-             << " type=" << res.anomaly_type
-             << " cpu_sev=" << std::fixed << std::setprecision(3) << res.dense_cpu_sev
-             << " mem_sev=" << res.dense_mem_sev;
-        ad_log(_oss.str());
+        std::cerr << "[daemon] ALERT "
+                  << rdg.mac << " ts=" << rdg.timestamp
+                  << " type=" << res.anomaly_type
+                  << " cpu_sev=" << std::fixed << std::setprecision(3) << res.dense_cpu_sev
+                  << " mem_sev=" << res.dense_mem_sev << "\n";
       }
       ++total_rows;
     }
@@ -529,7 +481,8 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
   // Process rows already in the file (unless --skip-existing)
   int startup_rows = total_rows;
   DrainFile();
-  { std::ostringstream _oss; _oss << "[daemon] Processed " << (total_rows - startup_rows) << " existing row(s). Waiting for new data..."; ad_log(_oss.str()); }
+  std::cerr << "[daemon] Processed " << (total_rows - startup_rows)
+            << " existing row(s). Waiting for new data...\n";
 
   // ── inotify setup (Linux) / polling fallback (non-Linux) ─────────────────
   // On Linux the kernel notifies us the instant the file is modified —
@@ -563,10 +516,9 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
   }
   const bool use_inotify = (ifd >= 0);
   if (use_inotify)
-    ad_log("[daemon] inotify active - waking immediately on file change.");
-  else {
-    std::ostringstream _oss; _oss << "[daemon] inotify unavailable - using stat polling (" << poll_ms << " ms)."; ad_log(_oss.str());
-  }
+    std::cerr << "[daemon] inotify active  — waking immediately on file change.\n";
+  else
+    std::cerr << "[daemon] inotify unavailable — using stat polling (" << poll_ms << " ms).\n";
 
   // inotify event buffer — sized for several events in one read()
   alignas(inotify_event) char ev_buf[16 * (sizeof(inotify_event) + NAME_MAX + 1)];
@@ -581,7 +533,7 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
       int ret = poll(&pfd, 1, poll_ms);
       if (ret < 0) {
         if (errno == EINTR) continue;
-        ad_log(std::string("[daemon] poll(): ") + strerror(errno));
+        std::cerr << "[daemon] poll(): " << strerror(errno) << "\n";
         break;
       }
 
@@ -606,7 +558,7 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
       if (reopen) {
         // The file was replaced or removed.  Wait for it to reappear
         // (the next IN_CREATE / IN_MOVED_TO unblocks the next poll()).
-        ad_log("[daemon] File replaced/removed: " + watch_path);
+        std::cerr << "[daemon] File replaced/removed: " << watch_path << "\n";
         fin.close(); fin.clear();
         while (!g_stop) {
           struct stat tmp;
@@ -621,7 +573,7 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
         // a second reopen on the next loop iteration, resetting last_pos to 0
         // and reprocessing already-handled rows.
         { ssize_t n_ev; while ((n_ev = read(ifd, ev_buf, sizeof(ev_buf))) > 0) {} }
-        ad_log("[daemon] Watching (new file): " + watch_path);
+        std::cerr << "[daemon] Watching (new file): " << watch_path << "\n";
       }
     } else
 #endif  // __linux__
@@ -634,20 +586,20 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
     struct stat st;
     if (stat(watch_path.c_str(), &st) != 0) {
       // File disappeared
-      ad_log("[daemon] " + watch_path + " gone. Waiting...");
+      std::cerr << "[daemon] " << watch_path << " gone. Waiting...\n";
       fin.close(); fin.clear();
       while (!g_stop && stat(watch_path.c_str(), &st) != 0)
         usleep(static_cast<useconds_t>(poll_ms) * 1000u);
       if (g_stop) break;
       if (!OpenWatchFile()) continue;
-      ad_log("[daemon] File reappeared: " + watch_path);
+      std::cerr << "[daemon] File reappeared: " << watch_path << "\n";
       continue;
     }
 
     const std::streampos cur_size = static_cast<std::streampos>(st.st_size);
     if (cur_size < last_pos) {
       // File was truncated or replaced (log rotation)
-      ad_log("[daemon] File rotated. Re-opening: " + watch_path);
+      std::cerr << "[daemon] File rotated. Re-opening: " << watch_path << "\n";
       if (!OpenWatchFile()) continue;
     }
 
@@ -667,7 +619,7 @@ static int RunDaemon(AnomalyInferenceEngine& engine,
   if (ifd >= 0) { inotify_rm_watch(ifd, iwd); close(ifd); }
 #endif
 
-  { std::ostringstream _oss; _oss << "[daemon] Stopped. Total rows processed: " << total_rows; ad_log(_oss.str()); }
+  std::cerr << "[daemon] Stopped. Total rows processed: " << total_rows << "\n";
   return EXIT_SUCCESS;
 }
 
@@ -759,7 +711,7 @@ int Main(int argc, char** argv) {
       PrintUsage(argv[0]);
       return EXIT_SUCCESS;
     } else {
-      ad_log("Unknown argument: " + arg);
+      std::cerr << "Unknown argument: " << arg << "\n";
       PrintUsage(argv[0]);
       return EXIT_FAILURE;
     }
@@ -767,25 +719,26 @@ int Main(int argc, char** argv) {
 
   // ── Library presence check (--check-libs flag) ────────────────────────────
   if (check_libs) {
-    ad_log("[lib-check] libtensorflowlite.so is required for all models.");
-    ad_log("[lib-check] Use: ldd ./anomaly_app | grep tflite");
+    std::cerr << "[lib-check] libtensorflowlite.so is required for all models.\n"
+              << "[lib-check] Use: ldd ./anomaly_app | grep tflite\n";
     return EXIT_SUCCESS;
   }
 
   // ── Initialise engine ─────────────────────────────────────────────────────
-  ad_log("Loading CPU config: " + config_path);
+  std::cerr << "Loading CPU config: " << config_path << "\n";
   if (!memory_config_path.empty())
-    ad_log("Loading memory config: " + memory_config_path);
+    std::cerr << "Loading memory config: " << memory_config_path << "\n";
   AnomalyInferenceEngine engine(config_path, memory_config_path,
                                 num_threads, delegate_path, delegate_options, verbose);
-  { std::ostringstream _oss; _oss << "Engine ready.  threads=" << num_threads; ad_log(_oss.str()); }
+  std::cerr << "Engine ready.  threads=" << num_threads << "\n";
 
   // ── Dispatch: watch mode (default) or batch mode (--input) ───────────────
   if (input_path.empty()) {
-    ad_log("[watcher] watch-path  : " + watch_path);
-    ad_log("[watcher] result-path : " + result_path);
-    { std::ostringstream _oss; _oss << "[watcher] timeout(ms) : " << poll_interval_ms << " (inotify safety timeout on Linux; poll interval on non-Linux)"; ad_log(_oss.str()); }
-    ad_log(std::string("[watcher] skip-existing: ") + (skip_existing ? "yes" : "no"));
+    std::cerr << "[watcher] watch-path  : " << watch_path      << "\n"
+              << "[watcher] result-path : " << result_path     << "\n"
+              << "[watcher] timeout(ms) : " << poll_interval_ms
+              << " (inotify safety timeout on Linux; poll interval on non-Linux)\n"
+              << "[watcher] skip-existing: " << (skip_existing ? "yes" : "no") << "\n";
     return RunDaemon(engine, watch_path, result_path,
                      poll_interval_ms, verbose, skip_existing);
   }
@@ -794,14 +747,14 @@ int Main(int argc, char** argv) {
   std::ifstream fin;
   if (!input_path.empty()) {
     fin.open(input_path);
-    if (!fin) { ad_log("Cannot open input: " + input_path); return EXIT_FAILURE; }
+    if (!fin) { std::cerr << "Cannot open input: " << input_path << "\n"; return EXIT_FAILURE; }
   }
   std::istream& in = fin.is_open() ? fin : std::cin;
 
   std::ofstream fout;
   if (!output_path.empty()) {
     fout.open(output_path);
-    if (!fout) { ad_log("Cannot open output: " + output_path); return EXIT_FAILURE; }
+    if (!fout) { std::cerr << "Cannot open output: " << output_path << "\n"; return EXIT_FAILURE; }
   }
   std::ostream& out = fout.is_open() ? fout : std::cout;
 
@@ -812,7 +765,7 @@ int Main(int argc, char** argv) {
   std::vector<std::string> cols;
 
   if (!in.good()) {
-    ad_log("Input is empty.");
+    std::cerr << "Input is empty.\n";
     return EXIT_FAILURE;
   }
   if (std::isalpha(static_cast<unsigned char>(in.peek()))) {
@@ -820,7 +773,7 @@ int Main(int argc, char** argv) {
     std::getline(in, header_line);
     cols = SplitCsv(header_line);
     if (!batch_ci.Parse(cols)) {
-      ad_log("Cannot find required columns (timestamp, CMMAC) in header.");
+      std::cerr << "Cannot find required columns (timestamp, CMMAC) in header.\n";
       return EXIT_FAILURE;
     }
   } else {
@@ -850,18 +803,16 @@ int Main(int argc, char** argv) {
 
   // ── Verbose header ────────────────────────────────────────────────────────
   if (verbose) {
-    std::ostringstream _oss;
-    _oss << "=== Streaming Inference ===\n"
-         << std::left
-         << std::setw(22) << "CMMAC"
-         << std::setw(8)  << "CPU%"
-         << std::setw(10) << "CPU_sev"
-         << std::setw(10) << "Mem_sev"
-         << std::setw(10) << "Type"
-         << std::setw(12) << "Time(ms)"
-         << "Alert\n"
-         << std::string(87, '-');
-    ad_log(_oss.str());
+    std::cerr << "\n=== Streaming Inference ===\n"
+              << std::left
+              << std::setw(22) << "CMMAC"
+              << std::setw(8)  << "CPU%"
+              << std::setw(10) << "CPU_sev"
+              << std::setw(10) << "Mem_sev"
+              << std::setw(10) << "Type"
+              << std::setw(12) << "Time(ms)"
+              << "Alert\n"
+              << std::string(87, '-') << "\n";
   }
 
   // ── Process rows ──────────────────────────────────────────────────────────
@@ -947,23 +898,21 @@ int Main(int argc, char** argv) {
         if (res.dense_mem_flag)
           alert += " Mem sev=" + std::to_string(res.dense_mem_sev).substr(0, 5) + "x";
       }
-      { std::ostringstream _oss;
-        _oss << std::left
-             << std::setw(22) << rdg.mac
-             << std::setw(8)  << std::fixed << std::setprecision(1) << rdg.used_cpu
-             << std::setw(10) << std::setprecision(3) << res.dense_cpu_sev
-             << std::setw(10) << res.dense_mem_sev
-             << std::setw(10) << res.anomaly_type
-             << std::setw(12) << std::setprecision(3) << elapsed_us / 1000.0 << "ms"
-             << alert;
-        ad_log(_oss.str()); }
+      std::cerr << std::left
+                << std::setw(22) << rdg.mac
+                << std::setw(8)  << std::fixed << std::setprecision(1) << rdg.used_cpu
+                << std::setw(10) << std::setprecision(3) << res.dense_cpu_sev
+                << std::setw(10) << res.dense_mem_sev
+                << std::setw(10) << res.anomaly_type
+                << std::setw(12) << std::setprecision(3) << elapsed_us / 1000.0 << "ms"
+                << alert << "\n";
     }
     ++row_num;
   }
 
   if (!header_written) WriteHeader();  // empty input edge case
 
-  { std::ostringstream _oss; _oss << "Processed " << row_num << " readings."; ad_log(_oss.str()); }
+  std::cerr << "\nProcessed " << row_num << " readings.\n";
   // if (row_num > 0) {
   //   std::cerr << std::fixed << std::setprecision(3)
   //             << "Total inference time : " << total_inference_us / 1000.0 << " ms\n"

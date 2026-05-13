@@ -31,18 +31,18 @@ Usage:
   anomaly_app [options]
 
 General options:
-  --config,  -c <path>   Path to inference_config.json
-                         (default: inference_config.json)
-  --threads, -t <n>      TFLite thread count (default: 1)
-  --delegate-path,  -d <path>
-                         External hardware delegate .so
-                         (e.g. /usr/lib/libbstorm_external_delegate.so)
-  --delegate-options <str>
-                         Semicolon-separated key:value delegate options
-                         (e.g. "bstm:1;bstm-client-mode:0;dynamic-tensors:1")
-  --verbose, -v          Print per-reading details to stderr
-  --check-libs           Check shared library availability and exit
-  --help,    -h          Print this message
+  --config,         -c <path>   CPU model config JSON
+                               (default: cpu_anomaly_config.json)
+  --memory-config      <path>   Memory model config JSON
+                               (optional; omit to use CPU-only inference)
+  --threads,        -t <n>     TFLite thread count (default: 1)
+  --delegate-path,  -d <path>  External hardware delegate .so
+                               (e.g. /usr/lib/libbstorm_external_delegate.so)
+  --delegate-options   <str>   Semicolon-separated key:value delegate options
+                               (e.g. "bstm:1;bstm-client-mode:0;dynamic-tensors:1")
+  --verbose,        -v         Print per-reading details to stderr
+  --check-libs                 Check shared library availability and exit
+  --help,           -h         Print this message
 
 File-watcher options (used when no --input is given):
   --watch-path  <path>   Device CSV file to monitor
@@ -630,8 +630,8 @@ static void PrintUsage(const char* prog) {
     << "  Reads a CSV of telemetry readings, runs TFLite anomaly models,\n"
     << "  and outputs anomaly classification results.\n\n"
     << "Usage: " << prog << " [options]\n\n"
-    << "  --cpu-config,   -c <path>   CPU model config JSON   (default: cpu_anomaly_config.json)\n"
-    << "  --memory-config <path>  Memory model config JSON (optional)\n"
+    << "  --config,         -c <path>   CPU model config JSON        (default: cpu_anomaly_config.json)\n"
+    << "  --memory-config      <path>   Memory model config JSON     (optional)\n"
     << "  --input,    -i <path>   Input CSV file          (default: stdin)\n"
     << "  --output,   -o <path>   Output CSV file         (default: stdout)\n"
     << "  --threads,  -t <n>      TFLite thread count     (default: 1)\n"

@@ -1,0 +1,53 @@
+{
+  "cpu_model_file": "tcn_cpu_anomaly_model_v2.tflite",
+  "mem_model_file": "tcn_mem_anomaly_model_v2.tflite",
+  "cpu_threshold": 0.007692869286984205,
+  "mem_threshold": 0.005448348354548216,
+  "window_size": 30,
+  "warmup_samples": 30,
+  "model_version": "v2_enhanced",
+  "cpu_features": [
+    "USED_CPU_ATOM",
+    "LOAD_AVG_ATOM",
+    "slab_ratio",
+    "load_cpu_ratio",
+    "cpu_delta",
+    "load_delta",
+    "hour_sin",
+    "hour_cos",
+    "day_sin",
+    "day_cos",
+    "total_clients"
+  ],
+  "mem_features": [
+    "mem_utilization",
+    "avail_to_total",
+    "free_to_avail",
+    "mem_fragmentation",
+    "cache_ratio",
+    "slab_to_free",
+    "USED_CPU_ATOM",
+    "LOAD_AVG_ATOM",
+    "total_clients",
+    "mem_per_client",
+    "hour_sin",
+    "hour_cos",
+    "day_sin",
+    "day_cos",
+    "mem_utilization_delta",
+    "avail_to_total_delta",
+    "slab_pressure_delta",
+    "free_to_avail_delta",
+    "mem_util_delta_abs",
+    "slab_delta_abs"
+  ],
+  "cpu_scaler": {
+    "min": [0.0, 0.0, 0.0, 0.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 0.0],
+    "max": [100.0, 10.0, 1.0, 10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 100.0]
+  },
+  "mem_scaler": {
+    "min": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 0.0, 0.0],
+    "max": [1.0, 1.0, 1.0, 1.0, 1.0, 10.0, 1.0, 10.0, 100.0, 100000.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  },
+  "description": "TCN autoencoder anomaly prediction configuration for RDKB gateway routers. Uses sliding window of 30 timesteps for CPU (11 features) and Memory (20 features) models."
+}

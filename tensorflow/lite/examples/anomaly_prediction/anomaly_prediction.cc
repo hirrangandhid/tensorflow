@@ -42,12 +42,14 @@ MSE: mean((input − reconstructed)²) over entire window
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 #include <sys/time.h>
+#include <sys/stat.h>
 
 #include "nlohmann_json/json.hpp"
 #include "tensorflow/lite/delegates/external/external_delegate.h"
@@ -59,6 +61,50 @@ namespace tflite {
 namespace anomaly_prediction {
 
 using json = nlohmann::json;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ENGINE LOGGING - writes to same log file as main
+// ══════════════════════════════════════════════════════════════════════════════
+
+static const char* ENGINE_LOG_PATH = "/rdklogs/logs/anomaly_predict_logs.txt";
+static std::ofstream g_engine_log;
+static std::mutex g_engine_log_mutex;
+static bool g_engine_log_init = false;
+
+static std::string EngineTimestamp() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  struct tm* tm_info = localtime(&tv.tv_sec);
+  char buf[64];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm_info);
+  char result[80];
+  snprintf(result, sizeof(result), "%s.%03d", buf, (int)(tv.tv_usec / 1000));
+  return std::string(result);
+}
+
+static void InitEngineLog() {
+  if (g_engine_log_init) return;
+  std::lock_guard<std::mutex> lock(g_engine_log_mutex);
+  if (g_engine_log_init) return;
+  mkdir("/rdklogs", 0755);
+  mkdir("/rdklogs/logs", 0755);
+  g_engine_log.open(ENGINE_LOG_PATH, std::ios::app);
+  g_engine_log_init = g_engine_log.is_open();
+}
+
+static void EngineLog(const char* level, const std::string& comp, const std::string& msg) {
+  if (!g_engine_log_init) InitEngineLog();
+  if (!g_engine_log_init) return;
+  std::lock_guard<std::mutex> lock(g_engine_log_mutex);
+  g_engine_log << "[" << EngineTimestamp() << "] [" << level << "] [" 
+               << comp << "] " << msg << "\n";
+  g_engine_log.flush();
+}
+
+#define ELOG_DEBUG(c, m) EngineLog("DEBUG", c, m)
+#define ELOG_INFO(c, m)  EngineLog("INFO ", c, m)
+#define ELOG_WARN(c, m)  do { EngineLog("WARN ", c, m); std::cerr << "[" << c << "] WARN: " << m << "\n"; } while(0)
+#define ELOG_ERROR(c, m) do { EngineLog("ERROR", c, m); std::cerr << "[" << c << "] ERROR: " << m << "\n"; } while(0)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper functions
@@ -84,34 +130,67 @@ static double GetTimeMs() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 PredictionConfig LoadPredictionConfig(const std::string& config_path) {
+  ELOG_INFO("Config", "Loading configuration from: " + config_path);
+  
   std::ifstream f(config_path);
-  if (!f) throw std::runtime_error("Cannot open config: " + config_path);
+  if (!f) {
+    ELOG_ERROR("Config", "Cannot open config file: " + config_path);
+    throw std::runtime_error("Cannot open config: " + config_path);
+  }
 
   json j;
-  f >> j;
+  try {
+    f >> j;
+    ELOG_DEBUG("Config", "JSON parsed successfully");
+  } catch (const std::exception& e) {
+    ELOG_ERROR("Config", "JSON parse error: " + std::string(e.what()));
+    throw;
+  }
 
   PredictionConfig cfg;
+  
+  // Model type: "autoencoder" (default) or "forecaster"
+  std::string model_type_str = j.value("model_type", "autoencoder");
+  if (model_type_str == "forecaster") {
+    cfg.model_type = ModelType::kForecaster;
+    ELOG_INFO("Config", "Model type: FORECASTER");
+  } else {
+    cfg.model_type = ModelType::kAutoencoder;
+    ELOG_INFO("Config", "Model type: AUTOENCODER");
+  }
   
   // Model files
   cfg.cpu_model_file = j.value("cpu_model_file", "tcn_cpu_anomaly_model_v2.tflite");
   cfg.mem_model_file = j.value("mem_model_file", "tcn_mem_anomaly_model_v2.tflite");
+  ELOG_INFO("Config", "CPU model file: " + cfg.cpu_model_file);
+  ELOG_INFO("Config", "Memory model file: " + cfg.mem_model_file);
   
   // Thresholds
   cfg.cpu_threshold = static_cast<float>(j.value("cpu_threshold", 0.00769));
   cfg.mem_threshold = static_cast<float>(j.value("mem_threshold", 0.00545));
+  ELOG_INFO("Config", "CPU threshold: " + std::to_string(cfg.cpu_threshold));
+  ELOG_INFO("Config", "Memory threshold: " + std::to_string(cfg.mem_threshold));
   
   // Window configuration
   cfg.window_size = j.value("window_size", kDefaultWindowSize);
   cfg.warmup_samples = j.value("warmup_samples", cfg.window_size);
+  ELOG_INFO("Config", "Window size: " + std::to_string(cfg.window_size));
+  ELOG_INFO("Config", "Warmup samples: " + std::to_string(cfg.warmup_samples));
   
   // Model version
   cfg.model_version = j.value("model_version", "v2_enhanced");
+  ELOG_DEBUG("Config", "Model version: " + cfg.model_version);
+  
+  // NPU compatibility
+  cfg.bstorm_compatible = j.value("bstorm_compatible", true);
+  ELOG_INFO("Config", "bstorm compatible: " + std::string(cfg.bstorm_compatible ? "yes" : "no"));
 
   // Parse CPU features
   if (j.contains("cpu_features")) {
     for (const auto& feat : j["cpu_features"]) {
       cfg.cpu_scaler.features.push_back(feat.get<std::string>());
     }
+    ELOG_DEBUG("Config", "Loaded " + std::to_string(cfg.cpu_scaler.features.size()) + " CPU features");
   }
   
   // Parse Memory features
@@ -119,6 +198,7 @@ PredictionConfig LoadPredictionConfig(const std::string& config_path) {
     for (const auto& feat : j["mem_features"]) {
       cfg.mem_scaler.features.push_back(feat.get<std::string>());
     }
+    ELOG_DEBUG("Config", "Loaded " + std::to_string(cfg.mem_scaler.features.size()) + " Memory features");
   }
 
   // Parse CPU scaler
@@ -134,6 +214,7 @@ PredictionConfig LoadPredictionConfig(const std::string& config_path) {
         cfg.cpu_scaler.data_max.push_back(static_cast<float>(v.get<double>()));
       }
     }
+    ELOG_DEBUG("Config", "Loaded CPU scaler with " + std::to_string(cfg.cpu_scaler.data_min.size()) + " min/max values");
   }
   
   // Parse Memory scaler
@@ -149,8 +230,10 @@ PredictionConfig LoadPredictionConfig(const std::string& config_path) {
         cfg.mem_scaler.data_max.push_back(static_cast<float>(v.get<double>()));
       }
     }
+    ELOG_DEBUG("Config", "Loaded Memory scaler with " + std::to_string(cfg.mem_scaler.data_min.size()) + " min/max values");
   }
 
+  ELOG_INFO("Config", "Configuration loaded successfully");
   return cfg;
 }
 
@@ -165,6 +248,13 @@ AnomalyPredictionEngine::AnomalyPredictionEngine(
     const std::string& delegate_options,
     bool verbose) {
   
+  ELOG_INFO("Engine", "Initializing AnomalyPredictionEngine");
+  ELOG_DEBUG("Engine", "  config_path: " + config_path);
+  ELOG_DEBUG("Engine", "  num_threads: " + std::to_string(num_threads));
+  ELOG_DEBUG("Engine", "  delegate_path: " + (delegate_path.empty() ? "(none)" : delegate_path));
+  ELOG_DEBUG("Engine", "  delegate_options: " + (delegate_options.empty() ? "(none)" : delegate_options));
+  ELOG_DEBUG("Engine", "  verbose: " + std::string(verbose ? "yes" : "no"));
+  
   num_threads_      = num_threads;
   delegate_path_    = delegate_path;
   delegate_options_ = delegate_options;
@@ -172,17 +262,24 @@ AnomalyPredictionEngine::AnomalyPredictionEngine(
 
   try {
     // Load configuration
+    ELOG_INFO("Engine", "Loading configuration...");
     LoadConfig(config_path);
+    ELOG_INFO("Engine", "Configuration loaded successfully");
 
     // Load CPU model
+    ELOG_INFO("Engine", "Loading CPU model: " + cfg_.cpu_model_file);
     LoadInterpreter(cfg_.cpu_model_file, cpu_model_fb_, cpu_interp_,
                     &cpu_ext_delegate_, "CPU");
+    ELOG_INFO("Engine", "CPU model loaded successfully");
 
     // Load Memory model
+    ELOG_INFO("Engine", "Loading Memory model: " + cfg_.mem_model_file);
     LoadInterpreter(cfg_.mem_model_file, mem_model_fb_, mem_interp_,
                     &mem_ext_delegate_, "Memory");
+    ELOG_INFO("Engine", "Memory model loaded successfully");
 
     initialized_ = true;
+    ELOG_INFO("Engine", "Engine initialized successfully");
     
     if (verbose_) {
       std::cerr << "[AnomalyPrediction] Initialized successfully\n";
@@ -191,6 +288,7 @@ AnomalyPredictionEngine::AnomalyPredictionEngine(
       std::cerr << "  Window size:    " << cfg_.window_size << "\n";
     }
   } catch (const std::exception& e) {
+    ELOG_ERROR("Engine", "Initialization failed: " + std::string(e.what()));
     std::cerr << "[AnomalyPrediction] Initialization failed: " << e.what() << "\n";
     initialized_ = false;
   }
@@ -201,6 +299,7 @@ AnomalyPredictionEngine::AnomalyPredictionEngine(
 // ─────────────────────────────────────────────────────────────────────────────
 
 void AnomalyPredictionEngine::LoadConfig(const std::string& config_path) {
+  ELOG_DEBUG("Engine", "LoadConfig called for: " + config_path);
   cfg_ = LoadPredictionConfig(config_path);
 }
 
@@ -215,23 +314,34 @@ void AnomalyPredictionEngine::LoadInterpreter(
     TfLiteDelegateUniquePtr* ext_delegate_out,
     const std::string& model_name) {
 
+  ELOG_INFO("Model", "Loading TFLite model [" + model_name + "]: " + path);
+  
   fb_out = tflite::FlatBufferModel::BuildFromFile(path.c_str());
-  if (!fb_out)
+  if (!fb_out) {
+    ELOG_ERROR("Model", "Failed to load TFLite model: " + path);
     throw std::runtime_error("Failed to load TFLite model: " + path);
+  }
+  ELOG_DEBUG("Model", "FlatBufferModel created for " + model_name);
 
   tflite::ops::builtin::BuiltinOpResolver resolver;
+  ELOG_DEBUG("Model", "Building interpreter for " + model_name);
   tflite::InterpreterBuilder(*fb_out, resolver)(&interp_out);
-  if (!interp_out)
+  if (!interp_out) {
+    ELOG_ERROR("Model", "Failed to build interpreter for: " + path);
     throw std::runtime_error("Failed to build interpreter for: " + path);
+  }
+  ELOG_DEBUG("Model", "Interpreter built successfully for " + model_name);
 
   // Apply external hardware delegate (e.g., bstorm) if provided
   if (!delegate_path_.empty()) {
+    ELOG_INFO("Delegate", "Applying external delegate for " + model_name + ": " + delegate_path_);
     TfLiteExternalDelegateOptions opts =
         TfLiteExternalDelegateOptionsDefault(delegate_path_.c_str());
 
     // Parse delegate options (key:value pairs separated by semicolons)
     std::vector<std::string> opt_keys, opt_vals;
     if (!delegate_options_.empty()) {
+      ELOG_DEBUG("Delegate", "Parsing delegate options: " + delegate_options_);
       std::vector<std::string> option_pairs;
       {
         std::stringstream oss(delegate_options_);
@@ -246,22 +356,28 @@ void AnomalyPredictionEngine::LoadInterpreter(
         if (colon != std::string::npos) {
           opt_keys.emplace_back(pair.substr(0, colon));
           opt_vals.emplace_back(pair.substr(colon + 1));
+          ELOG_DEBUG("Delegate", "  option: " + opt_keys.back() + " = " + opt_vals.back());
           TfLiteExternalDelegateOptionsInsert(
               &opts, opt_keys.back().c_str(), opt_vals.back().c_str());
         }
       }
     }
 
+    ELOG_INFO("Delegate", "Creating external delegate for " + model_name);
     TfLiteDelegate* raw = TfLiteExternalDelegateCreate(&opts);
     if (!raw) {
+      ELOG_WARN("Delegate", "TfLiteExternalDelegateCreate failed for " + model_name + " — running on CPU");
       std::cerr << "[delegate] Warning: TfLiteExternalDelegateCreate failed for "
                 << model_name << " — running on CPU\n";
     } else {
+      ELOG_INFO("Delegate", "Modifying graph with delegate for " + model_name);
       if (interp_out->ModifyGraphWithDelegate(raw) != kTfLiteOk) {
+        ELOG_WARN("Delegate", "ModifyGraphWithDelegate failed for " + model_name + " — running on CPU");
         std::cerr << "[delegate] Warning: ModifyGraphWithDelegate failed for "
                   << model_name << " — running on CPU\n";
         TfLiteExternalDelegateDelete(raw);
       } else {
+        ELOG_INFO("Delegate", "Hardware delegate applied successfully for " + model_name);
         std::cerr << "[delegate] Hardware delegate applied for " << model_name << "\n";
         if (ext_delegate_out)
           *ext_delegate_out = TfLiteDelegateUniquePtr{raw, TfLiteExternalDelegateDelete};
@@ -269,24 +385,35 @@ void AnomalyPredictionEngine::LoadInterpreter(
           TfLiteExternalDelegateDelete(raw);
       }
     }
+  } else {
+    ELOG_DEBUG("Delegate", "No external delegate specified, using CPU for " + model_name);
   }
 
+  ELOG_DEBUG("Model", "Setting thread count to " + std::to_string(num_threads_) + " for " + model_name);
   interp_out->SetNumThreads(num_threads_);
 
-  if (interp_out->AllocateTensors() != kTfLiteOk)
+  ELOG_INFO("Model", "Allocating tensors for " + model_name);
+  if (interp_out->AllocateTensors() != kTfLiteOk) {
+    ELOG_ERROR("Model", "AllocateTensors() failed for: " + path);
     throw std::runtime_error("AllocateTensors() failed for: " + path);
+  }
+  ELOG_INFO("Model", "Tensors allocated successfully for " + model_name);
+
+  // Log tensor shape
+  int input_idx = interp_out->inputs()[0];
+  TfLiteIntArray* dims = interp_out->tensor(input_idx)->dims;
+  std::ostringstream shape_ss;
+  shape_ss << "[";
+  for (int i = 0; i < dims->size; ++i) {
+    shape_ss << dims->data[i];
+    if (i < dims->size - 1) shape_ss << ", ";
+  }
+  shape_ss << "]";
+  ELOG_INFO("Model", model_name + " input shape: " + shape_ss.str());
 
   if (verbose_) {
     std::cerr << "[" << model_name << "] Model loaded: " << path << "\n";
-    // Print input tensor shape
-    int input_idx = interp_out->inputs()[0];
-    TfLiteIntArray* dims = interp_out->tensor(input_idx)->dims;
-    std::cerr << "  Input shape: [";
-    for (int i = 0; i < dims->size; ++i) {
-      std::cerr << dims->data[i];
-      if (i < dims->size - 1) std::cerr << ", ";
-    }
-    std::cerr << "]\n";
+    std::cerr << "  Input shape: " << shape_ss.str() << "\n";
   }
 }
 
@@ -491,22 +618,39 @@ float AnomalyPredictionEngine::RunInference(
     int window_size,
     int n_features) {
   
+  ELOG_DEBUG("Inference", "RunInference called - window_size=" + std::to_string(window_size) + 
+             " n_features=" + std::to_string(n_features) + 
+             " data_size=" + std::to_string(window_data.size()));
+  
   int input_idx = interp->inputs()[0];
   int output_idx = interp->outputs()[0];
   
   // Copy input data to tensor
   float* input_tensor = interp->typed_tensor<float>(input_idx);
+  if (!input_tensor) {
+    ELOG_ERROR("Inference", "Failed to get input tensor pointer");
+    return -1.0f;
+  }
   std::memcpy(input_tensor, window_data.data(), 
               window_data.size() * sizeof(float));
+  ELOG_DEBUG("Inference", "Input data copied to tensor");
   
   // Run inference
-  if (interp->Invoke() != kTfLiteOk) {
+  ELOG_DEBUG("Inference", "Invoking interpreter...");
+  TfLiteStatus status = interp->Invoke();
+  if (status != kTfLiteOk) {
+    ELOG_ERROR("Inference", "Invoke failed with status: " + std::to_string(status));
     std::cerr << "[Inference] Invoke failed\n";
     return -1.0f;
   }
+  ELOG_DEBUG("Inference", "Invoke completed successfully");
   
   // Get output and compute MSE
   float* output_tensor = interp->typed_tensor<float>(output_idx);
+  if (!output_tensor) {
+    ELOG_ERROR("Inference", "Failed to get output tensor pointer");
+    return -1.0f;
+  }
   
   float mse = 0.0f;
   int total_elements = window_size * n_features;
@@ -516,7 +660,74 @@ float AnomalyPredictionEngine::RunInference(
   }
   mse /= static_cast<float>(total_elements);
   
+  ELOG_DEBUG("Inference", "MSE computed: " + std::to_string(mse));
   return mse;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RunForecasterInference — TCN forecaster predicts next timestep
+// Returns: predicted next-step features (n_features)
+// ─────────────────────────────────────────────────────────────────────────────
+
+std::vector<float> AnomalyPredictionEngine::RunForecasterInference(
+    tflite::Interpreter* interp,
+    const std::vector<float>& window_data,
+    int n_features) {
+  
+  ELOG_DEBUG("Forecaster", "RunForecasterInference called - n_features=" + std::to_string(n_features));
+  
+  std::vector<float> prediction(n_features, 0.0f);
+  
+  int input_idx = interp->inputs()[0];
+  int output_idx = interp->outputs()[0];
+  
+  // Copy input data to tensor
+  float* input_tensor = interp->typed_tensor<float>(input_idx);
+  if (!input_tensor) {
+    ELOG_ERROR("Forecaster", "Failed to get input tensor pointer");
+    return prediction;
+  }
+  std::memcpy(input_tensor, window_data.data(), 
+              window_data.size() * sizeof(float));
+  
+  // Run inference
+  ELOG_DEBUG("Forecaster", "Invoking interpreter...");
+  TfLiteStatus status = interp->Invoke();
+  if (status != kTfLiteOk) {
+    ELOG_ERROR("Forecaster", "Invoke failed with status: " + std::to_string(status));
+    std::cerr << "[Forecaster] Invoke failed\n";
+    return prediction;
+  }
+  ELOG_DEBUG("Forecaster", "Invoke completed successfully");
+  
+  // Get output: shape (1, n_features) — predicted next timestep
+  float* output_tensor = interp->typed_tensor<float>(output_idx);
+  if (!output_tensor) {
+    ELOG_ERROR("Forecaster", "Failed to get output tensor pointer");
+    return prediction;
+  }
+  for (int i = 0; i < n_features; ++i) {
+    prediction[i] = output_tensor[i];
+  }
+  
+  return prediction;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ComputeForecastError — MSE between predicted and actual features
+// ─────────────────────────────────────────────────────────────────────────────
+
+float ComputeForecastError(const std::vector<float>& predicted,
+                           const std::vector<float>& actual) {
+  if (predicted.size() != actual.size() || predicted.empty()) {
+    return 0.0f;
+  }
+  float mse = 0.0f;
+  for (size_t i = 0; i < predicted.size(); ++i) {
+    float diff = predicted[i] - actual[i];
+    mse += diff * diff;
+  }
+  return mse / static_cast<float>(predicted.size());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -530,23 +741,61 @@ PredictionResult AnomalyPredictionEngine::ProcessReading(
   result.anomaly_type = "Normal";
   
   if (!initialized_) {
+    ELOG_WARN("Process", "ProcessReading called but engine not initialized");
     return result;
   }
+  
+  ELOG_DEBUG("Process", "ProcessReading - mac=" + reading.mac + " ts=" + reading.timestamp);
   
   DeviceState& state = GetState(reading.mac);
   
   // Compute features for this reading
+  ELOG_DEBUG("Process", "Computing features for " + reading.mac);
   std::vector<float> cpu_features, mem_features;
   ComputeCpuFeatures(reading, state, cpu_features);
   ComputeMemFeatures(reading, state, mem_features);
+  ELOG_DEBUG("Process", "Features computed - cpu=" + std::to_string(cpu_features.size()) + 
+             " mem=" + std::to_string(mem_features.size()));
   
   // Apply scaling
   std::vector<float> cpu_scaled = ApplyScaler(cpu_features, cfg_.cpu_scaler);
   std::vector<float> mem_scaled = ApplyScaler(mem_features, cfg_.mem_scaler);
+  ELOG_DEBUG("Process", "Features scaled");
+  
+  // ═══════════════════════════════════════════════════════════════════════════
+  // FORECASTER MODE: Compare previous prediction with current actual
+  // ═══════════════════════════════════════════════════════════════════════════
+  if (cfg_.model_type == ModelType::kForecaster) {
+    ELOG_DEBUG("Process", "Forecaster mode - checking previous predictions");
+    // If we have a previous prediction, compute forecast error
+    if (state.has_cpu_prediction && state.sample_count >= cfg_.warmup_samples) {
+      result.cpu_mse = ComputeForecastError(state.last_cpu_prediction, cpu_scaled);
+      result.cpu_severity = result.cpu_mse / cfg_.cpu_threshold;
+      result.cpu_anomaly = (result.cpu_mse > cfg_.cpu_threshold) ? 1 : 0;
+      ELOG_DEBUG("Process", "CPU forecast error: " + std::to_string(result.cpu_mse));
+    }
+    if (state.has_mem_prediction && state.sample_count >= cfg_.warmup_samples) {
+      result.mem_mse = ComputeForecastError(state.last_mem_prediction, mem_scaled);
+      result.mem_severity = result.mem_mse / cfg_.mem_threshold;
+      result.mem_anomaly = (result.mem_mse > cfg_.mem_threshold) ? 1 : 0;
+      ELOG_DEBUG("Process", "MEM forecast error: " + std::to_string(result.mem_mse));
+    }
+    
+    // Determine anomaly type
+    if (result.cpu_anomaly && result.mem_anomaly) {
+      result.anomaly_type = "Both";
+    } else if (result.cpu_anomaly) {
+      result.anomaly_type = "CPU";
+    } else if (result.mem_anomaly) {
+      result.anomaly_type = "Memory";
+    }
+    ELOG_DEBUG("Process", "Forecaster anomaly_type: " + result.anomaly_type);
+  }
   
   // Add to sliding windows
   state.cpu_window.push_back(cpu_scaled);
   state.mem_window.push_back(mem_scaled);
+  ELOG_DEBUG("Process", "Added to windows - cpu_window_size=" + std::to_string(state.cpu_window.size()));
   
   // Trim windows to size
   while (state.cpu_window.size() > static_cast<size_t>(cfg_.window_size)) {
@@ -562,6 +811,8 @@ PredictionResult AnomalyPredictionEngine::ProcessReading(
   
   // Run inference only if window is full
   if (!result.window_ready) {
+    ELOG_DEBUG("Process", "Window not ready - " + std::to_string(result.window_samples) + "/" + 
+               std::to_string(cfg_.window_size));
     if (verbose_) {
       std::cerr << "[" << reading.mac << "] Window filling: " 
                 << result.window_samples << "/" << cfg_.window_size << "\n";
@@ -569,41 +820,81 @@ PredictionResult AnomalyPredictionEngine::ProcessReading(
     return result;
   }
   
+  ELOG_INFO("Process", "Window ready, running inference for " + reading.mac);
   double start_time = GetTimeMs();
   
   // Flatten windows for inference
   std::vector<float> cpu_window_flat = FlattenWindow(state.cpu_window);
   std::vector<float> mem_window_flat = FlattenWindow(state.mem_window);
+  ELOG_DEBUG("Process", "Flattened windows - cpu=" + std::to_string(cpu_window_flat.size()) + 
+             " mem=" + std::to_string(mem_window_flat.size()));
   
-  // Run CPU model inference
-  result.cpu_mse = RunInference(cpu_interp_.get(), cpu_window_flat,
-                                cfg_.window_size, kCpuFeatureCount);
-  
-  // Run Memory model inference
-  result.mem_mse = RunInference(mem_interp_.get(), mem_window_flat,
-                                cfg_.window_size, kMemFeatureCount);
+  // ═══════════════════════════════════════════════════════════════════════════
+  // AUTOENCODER MODE: Compute reconstruction error
+  // ═══════════════════════════════════════════════════════════════════════════
+  if (cfg_.model_type == ModelType::kAutoencoder) {
+    ELOG_DEBUG("Process", "Autoencoder mode - running CPU inference");
+    // Run CPU model inference
+    result.cpu_mse = RunInference(cpu_interp_.get(), cpu_window_flat,
+                                  cfg_.window_size, kCpuFeatureCount);
+    ELOG_DEBUG("Process", "CPU inference done, MSE=" + std::to_string(result.cpu_mse));
+    
+    ELOG_DEBUG("Process", "Running MEM inference");
+    // Run Memory model inference
+    result.mem_mse = RunInference(mem_interp_.get(), mem_window_flat,
+                                  cfg_.window_size, kMemFeatureCount);
+    ELOG_DEBUG("Process", "MEM inference done, MSE=" + std::to_string(result.mem_mse));
+    
+    // Compute severity
+    result.cpu_severity = result.cpu_mse / cfg_.cpu_threshold;
+    result.mem_severity = result.mem_mse / cfg_.mem_threshold;
+    
+    // Apply thresholds (only after warmup)
+    if (state.sample_count >= cfg_.warmup_samples) {
+      result.cpu_anomaly = (result.cpu_mse > cfg_.cpu_threshold) ? 1 : 0;
+      result.mem_anomaly = (result.mem_mse > cfg_.mem_threshold) ? 1 : 0;
+      
+      // Determine anomaly type
+      if (result.cpu_anomaly && result.mem_anomaly) {
+        result.anomaly_type = "Both";
+      } else if (result.cpu_anomaly) {
+        result.anomaly_type = "CPU";
+      } else if (result.mem_anomaly) {
+        result.anomaly_type = "Memory";
+      }
+      ELOG_DEBUG("Process", "Autoencoder anomaly_type: " + result.anomaly_type);
+    } else {
+      ELOG_DEBUG("Process", "Still in warmup period - sample_count=" + 
+                 std::to_string(state.sample_count) + " warmup=" + std::to_string(cfg_.warmup_samples));
+    }
+  }
+  // ═══════════════════════════════════════════════════════════════════════════
+  // FORECASTER MODE: Predict next timestep
+  // ═══════════════════════════════════════════════════════════════════════════
+  else {
+    ELOG_DEBUG("Process", "Forecaster mode - predicting next timestep");
+    // Run forecaster to predict NEXT timestep
+    state.last_cpu_prediction = RunForecasterInference(
+        cpu_interp_.get(), cpu_window_flat, kCpuFeatureCount);
+    state.has_cpu_prediction = !state.last_cpu_prediction.empty();
+    ELOG_DEBUG("Process", "CPU forecaster prediction stored, has_prediction=" + 
+               std::to_string(state.has_cpu_prediction));
+    
+    state.last_mem_prediction = RunForecasterInference(
+        mem_interp_.get(), mem_window_flat, kMemFeatureCount);
+    state.has_mem_prediction = !state.last_mem_prediction.empty();
+    ELOG_DEBUG("Process", "MEM forecaster prediction stored, has_prediction=" + 
+               std::to_string(state.has_mem_prediction));
+  }
   
   double end_time = GetTimeMs();
   result.inference_time_ms = static_cast<float>(end_time - start_time);
   
-  // Compute severity
-  result.cpu_severity = result.cpu_mse / cfg_.cpu_threshold;
-  result.mem_severity = result.mem_mse / cfg_.mem_threshold;
-  
-  // Apply thresholds (only after warmup)
-  if (state.sample_count >= cfg_.warmup_samples) {
-    result.cpu_anomaly = (result.cpu_mse > cfg_.cpu_threshold) ? 1 : 0;
-    result.mem_anomaly = (result.mem_mse > cfg_.mem_threshold) ? 1 : 0;
-    
-    // Determine anomaly type
-    if (result.cpu_anomaly && result.mem_anomaly) {
-      result.anomaly_type = "Both";
-    } else if (result.cpu_anomaly) {
-      result.anomaly_type = "CPU";
-    } else if (result.mem_anomaly) {
-      result.anomaly_type = "Memory";
-    }
-  }
+  ELOG_INFO("Process", "Inference complete - mac=" + reading.mac + 
+            " cpu_mse=" + std::to_string(result.cpu_mse) + 
+            " mem_mse=" + std::to_string(result.mem_mse) + 
+            " type=" + result.anomaly_type + 
+            " time=" + std::to_string(result.inference_time_ms) + "ms");
   
   if (verbose_) {
     std::cerr << "[" << reading.mac << "] "

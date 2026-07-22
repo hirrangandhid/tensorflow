@@ -86,3 +86,11 @@ tf_workspace1()
 load("@//tensorflow:workspace0.bzl", "tf_workspace0")
 
 tf_workspace0()
+
+# copied from bstorm workspace
+load("//third_party/yocto/toolchains:yocto_compiler_configure.bzl", "yocto_crosstool")
+yocto_crosstool(
+    name = "yocto_crosstool",
+    build_file = str("//third_party/yocto/toolchains:BUILD"),
+)
+

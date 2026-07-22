@@ -1,14 +1,15 @@
 # TensorFlow Lite Anomaly Prediction Application
 
-TCN autoencoder-based inference application for **RDKB gateway routers** that predicts CPU and memory anomalies using sliding window temporal analysis. Supports hardware acceleration via the **bstorm delegate** for NPU offloading.
+TCN-based inference application for **RDKB gateway routers** that predicts CPU and memory anomalies using sliding window temporal analysis. Supports both **autoencoder** (reconstruction-based) and **forecaster** (prediction-based) models. Hardware acceleration via the **bstorm delegate** is available for NPU offloading.
 
 ---
 
 ## Features
 
+- **Dual Model Types**: Supports autoencoder (reconstruction error) and forecaster (prediction error) architectures
 - **Windowed TCN Inference**: Uses a 30-timestep sliding window for temporal pattern recognition
-- **Dual Model Support**: Separate models for CPU (11 features) and memory (20 features) anomaly detection
-- **bstorm Delegate**: Hardware acceleration for RDKB devices via external delegate API
+- **Dual Signal Support**: Separate models for CPU (11 features) and memory (20 features) anomaly detection
+- **bstorm Delegate**: Hardware acceleration for RDKB devices via external delegate API (autoencoder only)
 - **Batch & Watcher Modes**: Process CSV files or continuously monitor telemetry in real-time
 - **Configurable Thresholds**: JSON configuration for model paths, thresholds, and feature scaling
 
@@ -163,12 +164,96 @@ timestamp,cpu_mse,cpu_anomaly,mem_mse,mem_anomaly
 
 ## Model Architecture
 
-The application uses TCN (Temporal Convolutional Network) autoencoder models trained on normal RDKB gateway telemetry:
+The application supports two TCN (Temporal Convolutional Network) model architectures:
+
+### Autoencoder Mode (Default)
+
+Reconstruction-based anomaly detection. The model learns to reconstruct normal telemetry patterns.
 
 - **CPU Model**: Input shape `[1, 30, 11]` → Output shape `[1, 30, 11]`
 - **Memory Model**: Input shape `[1, 30, 20]` → Output shape `[1, 30, 20]`
+- **Anomaly Detection**: MSE between input window and reconstructed window exceeds threshold
+- **NPU Compatible**: Yes (bstorm delegate supported)
 
-Anomalies are detected when the Mean Squared Error (MSE) between input and reconstructed output exceeds the configured threshold.
+```bash
+# Run with autoencoder config
+./anomaly_prediction_app --config anomaly_prediction_config.json --input data.csv
+```
+
+### Forecaster Mode
+
+Prediction-based anomaly detection. The model predicts the next timestep from the current window.
+
+- **CPU Model**: Input shape `[1, 30, 11]` → Output shape `[1, 11]` (predicted t+1)
+- **Memory Model**: Input shape `[1, 30, 20]` → Output shape `[1, 20]` (predicted t+1)
+- **Anomaly Detection**: MSE between predicted t+1 and actual t+1 exceeds threshold
+- **NPU Compatible**: No (requires causal padding, CPU only)
+
+```bash
+# Run with forecaster config
+./anomaly_prediction_app --config forecaster_config.json --input data.csv
+```
+
+**Forecaster workflow:**
+1. Receive telemetry reading at time t
+2. Compare with prediction made at t-1 (if available)
+3. If MSE(predicted, actual) > threshold → anomaly
+4. Generate prediction for t+1 using window [t-29...t]
+
+---
+
+## Configuration File
+
+The JSON configuration specifies model type, paths, thresholds, and feature scaling:
+
+### Autoencoder Configuration
+
+```json
+{
+  "model_type": "autoencoder",
+  "cpu_model_file": "tcn_cpu_anomaly_model_v2.tflite",
+  "mem_model_file": "tcn_mem_anomaly_model_v2.tflite",
+  "cpu_threshold": 0.007692869286984205,
+  "mem_threshold": 0.005448348354548216,
+  "window_size": 30,
+  "warmup_samples": 30,
+  "bstorm_compatible": true,
+  "cpu_features": ["USED_CPU_ATOM", "LOAD_AVG_ATOM", ...],
+  "mem_features": ["mem_utilization", "avail_to_total", ...],
+  "cpu_scaler": { "min": [...], "max": [...] },
+  "mem_scaler": { "min": [...], "max": [...] }
+}
+```
+
+### Forecaster Configuration
+
+```json
+{
+  "model_type": "forecaster",
+  "cpu_model_file": "tcn_cpu_forecaster.tflite",
+  "mem_model_file": "tcn_mem_forecaster.tflite",
+  "cpu_threshold": 0.011065048165619373,
+  "mem_threshold": 0.017314743250608444,
+  "window_size": 30,
+  "warmup_samples": 30,
+  "bstorm_compatible": false,
+  "cpu_features": ["USED_CPU_ATOM", "LOAD_AVG_ATOM", ...],
+  "mem_features": ["mem_utilization", "avail_to_total", ...],
+  "cpu_scaler": { "min": [...], "max": [...] },
+  "mem_scaler": { "min": [...], "max": [...] }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `model_type` | `"autoencoder"` or `"forecaster"` (default: autoencoder) |
+| `cpu_model_file` | Path to CPU TFLite model |
+| `mem_model_file` | Path to Memory TFLite model |
+| `cpu_threshold` | MSE threshold for CPU anomaly |
+| `mem_threshold` | MSE threshold for Memory anomaly |
+| `window_size` | Sliding window size (default: 30) |
+| `warmup_samples` | Samples before anomaly detection activates |
+| `bstorm_compatible` | Whether model supports NPU acceleration |
 
 ---
 
@@ -193,16 +278,24 @@ bazel build --config=aarch64 \
    ```bash
    scp anomaly_prediction_app root@<device>:/usr/bin/
    scp *.tflite root@<device>:/etc/anomaly_models/
-   scp anomaly_prediction_config.json root@<device>:/etc/anomaly_models/
+   scp *_config.json root@<device>:/etc/anomaly_models/
    ```
 
-2. Run with bstorm delegate:
+2. Run with autoencoder model (bstorm NPU acceleration):
    ```bash
    /usr/bin/anomaly_prediction_app \
      --config /etc/anomaly_models/anomaly_prediction_config.json \
      --watch /tmp/telemetry.csv \
      --output /tmp/predictions.csv \
      --delegate-path /usr/lib/libbstorm_external_delegate.so
+   ```
+
+3. Run with forecaster model (CPU only):
+   ```bash
+   /usr/bin/anomaly_prediction_app \
+     --config /etc/anomaly_models/forecaster_config.json \
+     --watch /tmp/telemetry.csv \
+     --output /tmp/predictions.csv
    ```
 
 ---
@@ -212,9 +305,10 @@ bazel build --config=aarch64 \
 | File | Description |
 |------|-------------|
 | `anomaly_prediction.h` | Header with engine class and data structures |
-| `anomaly_prediction.cc` | Inference implementation |
+| `anomaly_prediction.cc` | Inference implementation (autoencoder + forecaster) |
 | `anomaly_prediction_main.cc` | CLI application |
-| `anomaly_prediction_config.json` | Default configuration |
+| `anomaly_prediction_config.json` | Autoencoder configuration |
+| `forecaster_config.json` | Forecaster configuration |
 | `BUILD` | Bazel build rules |
 | `CMakeLists.txt` | CMake build configuration |
 

@@ -72,7 +72,16 @@ struct ScalerParams {
 };
 
 // ── Inference configuration ──────────────────────────────────────────────────
+// ── Model type enum ──────────────────────────────────────────────────────────
+enum class ModelType {
+  kAutoencoder,   // Reconstructs window, anomaly = high reconstruction error
+  kForecaster     // Predicts next step, anomaly = prediction != actual
+};
+
 struct PredictionConfig {
+  // Model type: "autoencoder" or "forecaster"
+  ModelType model_type = ModelType::kAutoencoder;
+  
   // Model paths
   std::string cpu_model_file;
   std::string mem_model_file;
@@ -91,6 +100,9 @@ struct PredictionConfig {
   
   // Model version
   std::string model_version;
+  
+  // NPU compatibility flag
+  bool bstorm_compatible = true;
 };
 
 // ── Raw telemetry reading ────────────────────────────────────────────────────
@@ -162,6 +174,12 @@ struct DeviceState {
   bool cpu_initialized = false;
   bool mem_initialized = false;
   int sample_count = 0;
+  
+  // Forecaster mode: store last predictions to compare with actual
+  std::vector<float> last_cpu_prediction;  // predicted t+1 features
+  std::vector<float> last_mem_prediction;  // predicted t+1 features
+  bool has_cpu_prediction = false;
+  bool has_mem_prediction = false;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -260,6 +278,11 @@ class AnomalyPredictionEngine {
                      const std::vector<float>& window_data,
                      int window_size,
                      int n_features);
+  
+  // Run TCN forecaster inference, return predicted next timestep
+  std::vector<float> RunForecasterInference(tflite::Interpreter* interp,
+                                            const std::vector<float>& window_data,
+                                            int n_features);
 };
 
 // ── Config loader ────────────────────────────────────────────────────────────

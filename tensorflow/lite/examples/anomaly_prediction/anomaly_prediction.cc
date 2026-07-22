@@ -149,11 +149,14 @@ PredictionConfig LoadPredictionConfig(const std::string& config_path) {
 
   PredictionConfig cfg;
   
-  // Model type: "autoencoder" (default) or "forecaster"
+  // Model type: "autoencoder" (default), "forecaster", or "proactive_classifier"
   std::string model_type_str = j.value("model_type", "autoencoder");
   if (model_type_str == "forecaster") {
     cfg.model_type = ModelType::kForecaster;
     ELOG_INFO("Config", "Model type: FORECASTER");
+  } else if (model_type_str == "proactive_classifier" || model_type_str == "classifier") {
+    cfg.model_type = ModelType::kClassifier;
+    ELOG_INFO("Config", "Model type: PROACTIVE CLASSIFIER");
   } else {
     cfg.model_type = ModelType::kAutoencoder;
     ELOG_INFO("Config", "Model type: AUTOENCODER");
@@ -170,6 +173,14 @@ PredictionConfig LoadPredictionConfig(const std::string& config_path) {
   cfg.mem_threshold = static_cast<float>(j.value("mem_threshold", 0.00545));
   ELOG_INFO("Config", "CPU threshold: " + std::to_string(cfg.cpu_threshold));
   ELOG_INFO("Config", "Memory threshold: " + std::to_string(cfg.mem_threshold));
+  
+  // Classifier-specific settings
+  cfg.probability_threshold = static_cast<float>(j.value("probability_threshold", 0.5));
+  cfg.prediction_horizon = j.value("prediction_horizon", 5);
+  if (cfg.model_type == ModelType::kClassifier) {
+    ELOG_INFO("Config", "Probability threshold: " + std::to_string(cfg.probability_threshold));
+    ELOG_INFO("Config", "Prediction horizon: " + std::to_string(cfg.prediction_horizon) + " steps");
+  }
   
   // Window configuration
   cfg.window_size = j.value("window_size", kDefaultWindowSize);
@@ -731,6 +742,54 @@ float ComputeForecastError(const std::vector<float>& predicted,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// RunClassifierInference — TCN proactive classifier predicts anomaly probability
+// Returns: probability (0-1) that anomaly will occur within prediction_horizon
+// ─────────────────────────────────────────────────────────────────────────────
+
+float AnomalyPredictionEngine::RunClassifierInference(
+    tflite::Interpreter* interp,
+    const std::vector<float>& window_data) {
+  
+  ELOG_DEBUG("Classifier", "RunClassifierInference called");
+  
+  int input_idx = interp->inputs()[0];
+  int output_idx = interp->outputs()[0];
+  
+  // Copy input data to tensor
+  float* input_tensor = interp->typed_tensor<float>(input_idx);
+  if (!input_tensor) {
+    ELOG_ERROR("Classifier", "Failed to get input tensor pointer");
+    return 0.0f;
+  }
+  std::memcpy(input_tensor, window_data.data(), 
+              window_data.size() * sizeof(float));
+  
+  // Run inference
+  ELOG_DEBUG("Classifier", "Invoking interpreter...");
+  TfLiteStatus status = interp->Invoke();
+  if (status != kTfLiteOk) {
+    ELOG_ERROR("Classifier", "Invoke failed with status: " + std::to_string(status));
+    std::cerr << "[Classifier] Invoke failed\n";
+    return 0.0f;
+  }
+  ELOG_DEBUG("Classifier", "Invoke completed successfully");
+  
+  // Get output: shape (1, 1) — probability
+  float* output_tensor = interp->typed_tensor<float>(output_idx);
+  if (!output_tensor) {
+    ELOG_ERROR("Classifier", "Failed to get output tensor pointer");
+    return 0.0f;
+  }
+  
+  float probability = output_tensor[0];
+  // Clamp to valid range (sigmoid should already be 0-1, but be safe)
+  probability = std::max(0.0f, std::min(1.0f, probability));
+  
+  ELOG_DEBUG("Classifier", "Output probability: " + std::to_string(probability));
+  return probability;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ProcessReading — main entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -863,6 +922,50 @@ PredictionResult AnomalyPredictionEngine::ProcessReading(
         result.anomaly_type = "Memory";
       }
       ELOG_DEBUG("Process", "Autoencoder anomaly_type: " + result.anomaly_type);
+    } else {
+      ELOG_DEBUG("Process", "Still in warmup period - sample_count=" + 
+                 std::to_string(state.sample_count) + " warmup=" + std::to_string(cfg_.warmup_samples));
+    }
+  }
+  // ═══════════════════════════════════════════════════════════════════════════
+  // CLASSIFIER MODE: Proactive anomaly prediction
+  // Predicts probability of anomaly within next N steps
+  // ═══════════════════════════════════════════════════════════════════════════
+  else if (cfg_.model_type == ModelType::kClassifier) {
+    ELOG_DEBUG("Process", "Classifier mode - predicting anomaly probability");
+    result.is_proactive = true;
+    
+    // Run CPU classifier
+    result.cpu_anomaly_probability = RunClassifierInference(
+        cpu_interp_.get(), cpu_window_flat);
+    ELOG_DEBUG("Process", "CPU classifier probability: " + 
+               std::to_string(result.cpu_anomaly_probability));
+    
+    // Run Memory classifier
+    result.mem_anomaly_probability = RunClassifierInference(
+        mem_interp_.get(), mem_window_flat);
+    ELOG_DEBUG("Process", "MEM classifier probability: " + 
+               std::to_string(result.mem_anomaly_probability));
+    
+    // Set severity as the probability itself
+    result.cpu_severity = result.cpu_anomaly_probability;
+    result.mem_severity = result.mem_anomaly_probability;
+    
+    // Apply probability threshold (only after warmup)
+    if (state.sample_count >= cfg_.warmup_samples) {
+      result.cpu_anomaly = (result.cpu_anomaly_probability > cfg_.probability_threshold) ? 1 : 0;
+      result.mem_anomaly = (result.mem_anomaly_probability > cfg_.probability_threshold) ? 1 : 0;
+      
+      // Determine anomaly type
+      if (result.cpu_anomaly && result.mem_anomaly) {
+        result.anomaly_type = "Both";
+      } else if (result.cpu_anomaly) {
+        result.anomaly_type = "CPU";
+      } else if (result.mem_anomaly) {
+        result.anomaly_type = "Memory";
+      }
+      ELOG_DEBUG("Process", "Classifier anomaly_type: " + result.anomaly_type + 
+                 " (proactive, predicting " + std::to_string(cfg_.prediction_horizon) + " steps ahead)");
     } else {
       ELOG_DEBUG("Process", "Still in warmup period - sample_count=" + 
                  std::to_string(state.sample_count) + " warmup=" + std::to_string(cfg_.warmup_samples));

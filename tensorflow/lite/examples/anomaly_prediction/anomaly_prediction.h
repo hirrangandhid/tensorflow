@@ -22,8 +22,10 @@ anomaly detection using sliding window approach.
 Designed for edge deployment on RDKB routers with bstorm delegate support.
 
 Models supported:
-  tcn_cpu_anomaly_model_v2.tflite    CPU TCN AE   input (1, 30, 11)
-  tcn_mem_anomaly_model_v2.tflite    Mem TCN AE   input (1, 30, 20)
+  tcn_cpu_anomaly_model_v2.tflite    CPU TCN AE       input (1, 30, 11) → output (1, 30, 11)
+  tcn_mem_anomaly_model_v2.tflite    Mem TCN AE       input (1, 30, 20) → output (1, 30, 20)
+  tcn_cpu_classifier.tflite          CPU Classifier   input (1, 30, 11) → output (1, 1)
+  tcn_mem_classifier.tflite          Mem Classifier   input (1, 30, 20) → output (1, 1)
 
 Window-based inference:
   - Maintains sliding window of 30 timesteps per device
@@ -75,7 +77,8 @@ struct ScalerParams {
 // ── Model type enum ──────────────────────────────────────────────────────────
 enum class ModelType {
   kAutoencoder,   // Reconstructs window, anomaly = high reconstruction error
-  kForecaster     // Predicts next step, anomaly = prediction != actual
+  kForecaster,    // Predicts next step, anomaly = prediction != actual
+  kClassifier     // Proactive: outputs probability of anomaly in next N steps
 };
 
 struct PredictionConfig {
@@ -86,9 +89,15 @@ struct PredictionConfig {
   std::string cpu_model_file;
   std::string mem_model_file;
   
-  // Thresholds
+  // Thresholds (MSE for autoencoder/forecaster, probability for classifier)
   float cpu_threshold = 0.00769f;
   float mem_threshold = 0.00545f;
+  
+  // Classifier-specific: probability threshold (default 0.5)
+  float probability_threshold = 0.5f;
+  
+  // Classifier-specific: prediction horizon (how many steps ahead)
+  int prediction_horizon = 5;
   
   // Window configuration
   int window_size = kDefaultWindowSize;
@@ -133,20 +142,28 @@ struct TelemetryReading {
 
 // ── Prediction result ────────────────────────────────────────────────────────
 struct PredictionResult {
-  // Reconstruction errors (MSE)
+  // Reconstruction errors (MSE) - for autoencoder/forecaster modes
   float cpu_mse = 0.0f;
   float mem_mse = 0.0f;
+  
+  // Classifier probabilities (0-1) - for classifier mode
+  // Probability that anomaly will occur within prediction_horizon steps
+  float cpu_anomaly_probability = 0.0f;
+  float mem_anomaly_probability = 0.0f;
   
   // Anomaly flags (1 = anomaly)
   int cpu_anomaly = 0;
   int mem_anomaly = 0;
   
-  // Severity scores (MSE / threshold, > 1.0 = anomaly)
+  // Severity scores (MSE / threshold for AE, probability for classifier)
   float cpu_severity = 0.0f;
   float mem_severity = 0.0f;
   
   // Combined status
   std::string anomaly_type;    // "Normal" | "CPU" | "Memory" | "Both"
+  
+  // Prediction type indicator
+  bool is_proactive = false;   // true if classifier mode (predicting BEFORE anomaly)
   
   // Timing
   float inference_time_ms = 0.0f;
@@ -283,6 +300,10 @@ class AnomalyPredictionEngine {
   std::vector<float> RunForecasterInference(tflite::Interpreter* interp,
                                             const std::vector<float>& window_data,
                                             int n_features);
+  
+  // Run TCN classifier inference, return probability of upcoming anomaly
+  float RunClassifierInference(tflite::Interpreter* interp,
+                               const std::vector<float>& window_data);
 };
 
 // ── Config loader ────────────────────────────────────────────────────────────

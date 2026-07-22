@@ -286,23 +286,41 @@ TelemetryReading ParseRow(const std::vector<std::string>& row,
 
 // ── Output formatting ────────────────────────────────────────────────────────
 
-void WriteResultHeader(std::ostream& out) {
-  out << "timestamp,CMMAC,cpu_mse,mem_mse,cpu_anomaly,mem_anomaly,"
-      << "cpu_severity,mem_severity,anomaly_type,inference_ms\n";
+void WriteResultHeader(std::ostream& out, bool is_classifier = false) {
+  if (is_classifier) {
+    out << "timestamp,CMMAC,cpu_probability,mem_probability,cpu_anomaly,mem_anomaly,"
+        << "cpu_severity,mem_severity,anomaly_type,is_proactive,inference_ms\n";
+  } else {
+    out << "timestamp,CMMAC,cpu_mse,mem_mse,cpu_anomaly,mem_anomaly,"
+        << "cpu_severity,mem_severity,anomaly_type,inference_ms\n";
+  }
 }
 
 void WriteResult(std::ostream& out, const TelemetryReading& r, 
                  const PredictionResult& res) {
   out << r.timestamp << ","
-      << r.mac << ","
-      << std::fixed << std::setprecision(8) << res.cpu_mse << ","
-      << res.mem_mse << ","
-      << res.cpu_anomaly << ","
+      << r.mac << ",";
+  
+  // Use probability for classifier mode, MSE for autoencoder/forecaster
+  if (res.is_proactive) {
+    out << std::fixed << std::setprecision(4) << res.cpu_anomaly_probability << ","
+        << res.mem_anomaly_probability << ",";
+  } else {
+    out << std::fixed << std::setprecision(8) << res.cpu_mse << ","
+        << res.mem_mse << ",";
+  }
+  
+  out << res.cpu_anomaly << ","
       << res.mem_anomaly << ","
       << std::setprecision(4) << res.cpu_severity << ","
       << res.mem_severity << ","
-      << res.anomaly_type << ","
-      << std::setprecision(2) << res.inference_time_ms << "\n";
+      << res.anomaly_type << ",";
+  
+  if (res.is_proactive) {
+    out << "1,";  // is_proactive flag
+  }
+  
+  out << std::setprecision(2) << res.inference_time_ms << "\n";
 }
 
 // ── Batch mode ───────────────────────────────────────────────────────────────
@@ -351,8 +369,9 @@ int RunBatch(AnomalyPredictionEngine& engine,
   LOG_DEBUG("Batch", "Column mappings - timestamp:" + std::to_string(colmap.timestamp) + 
             " mac:" + std::to_string(colmap.mac) + " cpu:" + std::to_string(colmap.used_cpu));
   
-  // Write output header
-  WriteResultHeader(*out);
+  // Write output header (check if classifier mode for different header format)
+  bool is_classifier = (engine.GetConfig().model_type == ModelType::kClassifier);
+  WriteResultHeader(*out, is_classifier);
   
   // Process rows
   int total_rows = 0;
@@ -381,10 +400,17 @@ int RunBatch(AnomalyPredictionEngine& engine,
       
       if (result.cpu_anomaly || result.mem_anomaly) {
         anomaly_count++;
-        LOG_INFO("Batch", "ANOMALY DETECTED at " + reading.timestamp + 
-                 " mac=" + reading.mac + " type=" + result.anomaly_type +
-                 " cpu_mse=" + std::to_string(result.cpu_mse) +
-                 " mem_mse=" + std::to_string(result.mem_mse));
+        if (result.is_proactive) {
+          LOG_INFO("Batch", "PROACTIVE ANOMALY WARNING at " + reading.timestamp + 
+                   " mac=" + reading.mac + " type=" + result.anomaly_type +
+                   " cpu_prob=" + std::to_string(result.cpu_anomaly_probability) +
+                   " mem_prob=" + std::to_string(result.mem_anomaly_probability));
+        } else {
+          LOG_INFO("Batch", "ANOMALY DETECTED at " + reading.timestamp + 
+                   " mac=" + reading.mac + " type=" + result.anomaly_type +
+                   " cpu_mse=" + std::to_string(result.cpu_mse) +
+                   " mem_mse=" + std::to_string(result.mem_mse));
+        }
       }
     }
   }
@@ -455,9 +481,10 @@ int RunWatcher(AnomalyPredictionEngine& engine,
   LOG_DEBUG("Watcher", "Result file opened for appending");
   
   // Check if result file is empty, write header if so
+  bool is_classifier = (engine.GetConfig().model_type == ModelType::kClassifier);
   result_file.seekp(0, std::ios::end);
   if (result_file.tellp() == 0) {
-    WriteResultHeader(result_file);
+    WriteResultHeader(result_file, is_classifier);
     result_file.flush();
     LOG_DEBUG("Watcher", "Wrote header to empty result file");
   }
@@ -605,16 +632,29 @@ int RunWatcher(AnomalyPredictionEngine& engine,
         
         if (result.cpu_anomaly || result.mem_anomaly) {
           total_anomalies++;
-          LOG_WARN("Watcher", "ANOMALY DETECTED at " + reading.timestamp + 
-                   " mac=" + reading.mac + " type=" + result.anomaly_type +
-                   " cpu_mse=" + std::to_string(result.cpu_mse) +
-                   " cpu_sev=" + std::to_string(result.cpu_severity) +
-                   " mem_mse=" + std::to_string(result.mem_mse) +
-                   " mem_sev=" + std::to_string(result.mem_severity));
+          if (result.is_proactive) {
+            LOG_WARN("Watcher", "PROACTIVE ANOMALY WARNING at " + reading.timestamp + 
+                     " mac=" + reading.mac + " type=" + result.anomaly_type +
+                     " cpu_prob=" + std::to_string(result.cpu_anomaly_probability) +
+                     " mem_prob=" + std::to_string(result.mem_anomaly_probability));
+          } else {
+            LOG_WARN("Watcher", "ANOMALY DETECTED at " + reading.timestamp + 
+                     " mac=" + reading.mac + " type=" + result.anomaly_type +
+                     " cpu_mse=" + std::to_string(result.cpu_mse) +
+                     " cpu_sev=" + std::to_string(result.cpu_severity) +
+                     " mem_mse=" + std::to_string(result.mem_mse) +
+                     " mem_sev=" + std::to_string(result.mem_severity));
+          }
         } else {
-          LOG_DEBUG("Watcher", "Normal - " + reading.timestamp + " " + reading.mac +
-                    " cpu_mse=" + std::to_string(result.cpu_mse) +
-                    " mem_mse=" + std::to_string(result.mem_mse));
+          if (result.is_proactive) {
+            LOG_DEBUG("Watcher", "Normal - " + reading.timestamp + " " + reading.mac +
+                      " cpu_prob=" + std::to_string(result.cpu_anomaly_probability) +
+                      " mem_prob=" + std::to_string(result.mem_anomaly_probability));
+          } else {
+            LOG_DEBUG("Watcher", "Normal - " + reading.timestamp + " " + reading.mac +
+                      " cpu_mse=" + std::to_string(result.cpu_mse) +
+                      " mem_mse=" + std::to_string(result.mem_mse));
+          }
         }
         
         if (verbose || result.cpu_anomaly || result.mem_anomaly) {
